@@ -63,6 +63,8 @@ mod ingest_api_source;
 mod kafka_source;
 #[cfg(feature = "kinesis")]
 mod kinesis;
+#[cfg(feature = "pulsar")]
+mod pulsar_source;
 mod source_factory;
 mod vec_source;
 mod void_source;

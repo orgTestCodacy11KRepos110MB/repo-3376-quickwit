@@ -258,6 +258,10 @@ impl TryFrom<KinesisSourceParamsInner> for KinesisSourceParams {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PulsarSourceParams {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VecSourceParams {
     pub docs: Vec<String>,
     pub batch_num_docs: usize,

@@ -101,6 +101,7 @@ prost = { version = "0.11.2", default-features = false, features = [
 ] }
 prost-build = "0.11.2"
 prost-types = "0.11.2"
+pulsar = "5.0"
 rand = "0.8"
 rand_distr = "0.4"
 rayon = "1"

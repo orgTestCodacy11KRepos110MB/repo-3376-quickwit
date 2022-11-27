@@ -24,6 +24,7 @@ libz-sys = { workspace = true, optional = true }
 once_cell = { workspace = true }
 oneshot = { workspace = true }
 openssl = { workspace = true, optional = true }
+pulsar = { workspace = true, optional = true }
 rdkafka = { workspace = true, features = [
     "ssl",
     "sasl",
@@ -58,6 +59,7 @@ kafka-broker-tests = []
 vendored-kafka = ["kafka", "libz-sys/static", "openssl/vendored"]
 kinesis = ["rusoto_core", "rusoto_kinesis", "quickwit-aws/kinesis"]
 kinesis-localstack-tests = []
+pulsar = ["dep:pulsar"]
 testsuite = []
 
 [dev-dependencies]
