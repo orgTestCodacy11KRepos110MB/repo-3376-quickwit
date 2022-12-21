@@ -27,16 +27,13 @@ mod lazy_file_backed_index;
 mod store_operations;
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::try_join_all;
-use itertools::Itertools;
 use quickwit_common::uri::Uri;
-use quickwit_config::SourceConfig;
-use quickwit_doc_mapper::tag_pruning::TagFilterAst;
+use quickwit_config::{IndexConfig, SourceConfig};
 use quickwit_proto::metastore_api::{DeleteQuery, DeleteTask};
 use quickwit_storage::Storage;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -50,7 +47,8 @@ use self::store_operations::{
 };
 use crate::checkpoint::IndexCheckpointDelta;
 use crate::{
-    IndexMetadata, Metastore, MetastoreError, MetastoreResult, Split, SplitMetadata, SplitState,
+    IndexMetadata, ListSplitsQuery, Metastore, MetastoreError, MetastoreResult, Split,
+    SplitMetadata, SplitState,
 };
 
 /// State of an index tracked by the metastore.
@@ -152,7 +150,7 @@ impl FileBackedMetastore {
         if !mutation_occurred {
             return Ok(false);
         }
-
+        locked_index.set_recently_modified();
         let put_result = put_index(&*self.storage, &index).await;
         match put_result {
             Ok(()) => {
@@ -272,8 +270,8 @@ impl FileBackedMetastore {
 impl Metastore for FileBackedMetastore {
     /// -------------------------------------------------------------------------------
     /// Mutations over the high-level index.
-    async fn create_index(&self, index_metadata: IndexMetadata) -> MetastoreResult<()> {
-        let index_id = index_metadata.index_id.clone();
+    async fn create_index(&self, index_config: IndexConfig) -> MetastoreResult<()> {
+        let index_id = index_config.index_id.clone();
 
         // We pick the outer lock here, so that we enter a critical section.
         let mut per_index_metastores_wlock = self.per_index_metastores.write().await;
@@ -287,10 +285,10 @@ impl Metastore for FileBackedMetastore {
         if let Some(index_state) = per_index_metastores_wlock.get(&index_id) {
             if let IndexState::Alive(_) = index_state {
                 return Err(MetastoreError::IndexAlreadyExists {
-                    index_id: index_metadata.index_id.clone(),
+                    index_id: index_id.clone(),
                 });
             }
-        } else if index_exists(&*self.storage, &index_metadata.index_id).await? {
+        } else if index_exists(&*self.storage, &index_id).await? {
             return Err(MetastoreError::InternalError {
                 message: format!("Index {index_id} cannot be created."),
                 cause: format!(
@@ -308,7 +306,7 @@ impl Metastore for FileBackedMetastore {
         }
 
         // Put index metadata on storage.
-        let index = FileBackedIndex::from(index_metadata);
+        let index = FileBackedIndex::from(IndexMetadata::new(index_config));
         put_index(&*self.storage, &index).await?;
 
         per_index_metastores_wlock.insert(
@@ -379,14 +377,30 @@ impl Metastore for FileBackedMetastore {
     /// -------------------------------------------------------------------------------
     /// Mutations over a single index
 
-    async fn stage_split(
+    async fn stage_splits(
         &self,
         index_id: &str,
-        split_metadata: SplitMetadata,
+        split_metadata_list: Vec<SplitMetadata>,
     ) -> MetastoreResult<()> {
         self.mutate(index_id, |index| {
-            index.stage_split(split_metadata)?;
-            Ok(true)
+            let mut failed_split_ids = Vec::new();
+            for split_metadata in split_metadata_list {
+                match index.stage_split(split_metadata) {
+                    Ok(()) => {}
+                    Err(MetastoreError::SplitsNotStaged { split_ids }) => {
+                        failed_split_ids.extend(split_ids);
+                    }
+                    Err(error) => return Err(error),
+                };
+            }
+
+            if !failed_split_ids.is_empty() {
+                Err(MetastoreError::SplitsNotStaged {
+                    split_ids: failed_split_ids,
+                })
+            } else {
+                Ok(true)
+            }
         })
         .await?;
         Ok(())
@@ -420,6 +434,7 @@ impl Metastore for FileBackedMetastore {
                     SplitState::Published,
                     SplitState::MarkedForDeletion,
                 ],
+                false,
             )
         })
         .await?;
@@ -440,8 +455,11 @@ impl Metastore for FileBackedMetastore {
     }
 
     async fn add_source(&self, index_id: &str, source: SourceConfig) -> MetastoreResult<()> {
-        self.mutate(index_id, |index| index.add_source(source))
-            .await?;
+        self.mutate(index_id, |index| {
+            index.add_source(source)?;
+            Ok(true)
+        })
+        .await?;
         Ok(())
     }
 
@@ -475,21 +493,9 @@ impl Metastore for FileBackedMetastore {
     /// -------------------------------------------------------------------------------
     /// Read-only accessors
 
-    async fn list_splits(
-        &self,
-        index_id: &str,
-        state: SplitState,
-        time_range_opt: Option<Range<i64>>,
-        tags: Option<TagFilterAst>,
-    ) -> MetastoreResult<Vec<Split>> {
-        self.read(index_id, |index| {
-            index.list_splits(state, time_range_opt, tags, None)
-        })
-        .await
-    }
-
-    async fn list_all_splits(&self, index_id: &str) -> MetastoreResult<Vec<Split>> {
-        self.read(index_id, |index| index.list_all_splits()).await
+    async fn list_splits<'a>(&self, query: ListSplitsQuery<'a>) -> MetastoreResult<Vec<Split>> {
+        self.read(query.index_id, |index| index.list_splits(query))
+            .await
     }
 
     async fn index_metadata(&self, index_id: &str) -> MetastoreResult<IndexMetadata> {
@@ -508,37 +514,6 @@ impl Metastore for FileBackedMetastore {
                 })
                 .map(|index_id| self.index_metadata(index_id)),
         )
-        .await
-    }
-
-    async fn list_stale_splits(
-        &self,
-        index_id: &str,
-        delete_opstamp: u64,
-        num_splits: usize,
-    ) -> MetastoreResult<Vec<Split>> {
-        self.read(index_id, |index| {
-            let splits = index
-                .list_splits(SplitState::Published, None, None, Some(delete_opstamp))?
-                .into_iter()
-                // Ordering by:
-                // - delete_opstamp ASC
-                // - publish_timestamp ASC
-                .sorted_by(|split_left, split_right| {
-                    split_left
-                        .split_metadata
-                        .delete_opstamp
-                        .cmp(&split_right.split_metadata.delete_opstamp)
-                        .then_with(|| {
-                            split_left
-                                .publish_timestamp
-                                .cmp(&split_right.publish_timestamp)
-                        })
-                })
-                .take(num_splits)
-                .collect_vec();
-            Ok(splits)
-        })
         .await
     }
 
@@ -645,6 +620,7 @@ mod tests {
     use std::sync::Arc;
 
     use futures::executor::block_on;
+    use quickwit_config::IndexConfig;
     use quickwit_proto::metastore_api::DeleteQuery;
     use quickwit_storage::{MockStorage, RamStorage, Storage, StorageErrorKind};
     use rand::Rng;
@@ -657,7 +633,9 @@ mod tests {
     };
     use super::{FileBackedIndex, FileBackedMetastore, IndexState};
     use crate::tests::test_suite::DefaultForTest;
-    use crate::{IndexMetadata, Metastore, MetastoreError, SplitMetadata, SplitState};
+    use crate::{
+        IndexMetadata, ListSplitsQuery, Metastore, MetastoreError, SplitMetadata, SplitState,
+    };
 
     #[tokio::test]
     async fn test_file_backed_metastore_index_exists() {
@@ -665,8 +643,8 @@ mod tests {
         let metastore = FileBackedMetastore::default_for_test().await;
         assert!(!metastore.index_exists(index_id).await.unwrap());
 
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
-        metastore.create_index(index_metadata).await.unwrap();
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
+        metastore.create_index(index_config).await.unwrap();
 
         assert!(metastore.index_exists(index_id).await.unwrap());
     }
@@ -675,18 +653,18 @@ mod tests {
     async fn test_file_backed_metastore_get_index() {
         let index_id = "test-index";
         let metastore = FileBackedMetastore::default_for_test().await;
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
 
         // Create index
-        metastore
-            .create_index(index_metadata.clone())
-            .await
-            .unwrap();
+        metastore.create_index(index_config.clone()).await.unwrap();
 
         // Open index and check its metadata
         let created_index = metastore.get_index(index_id).await.unwrap();
-        assert_eq!(created_index.index_id(), index_metadata.index_id);
-        assert_eq!(created_index.metadata().index_uri, index_metadata.index_uri);
+        assert_eq!(created_index.index_id(), index_config.index_id);
+        assert_eq!(
+            created_index.metadata().index_uri(),
+            &index_config.index_uri
+        );
 
         // Check index is returned by list indexes.
         let indexes = metastore.list_indexes_metadatas().await.unwrap();
@@ -747,14 +725,14 @@ mod tests {
             ..Default::default()
         };
 
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
 
         // create index
-        metastore.create_index(index_metadata).await.unwrap();
+        metastore.create_index(index_config).await.unwrap();
 
         // stage split
         metastore
-            .stage_split(index_id, split_metadata)
+            .stage_splits(index_id, vec![split_metadata])
             .await
             .unwrap();
 
@@ -765,17 +743,13 @@ mod tests {
         assert!(err.is_err());
 
         // empty
-        let split = metastore
-            .list_splits(index_id, SplitState::Published, None, None)
-            .await
-            .unwrap();
+        let query = ListSplitsQuery::for_index(index_id).with_split_state(SplitState::Published);
+        let split = metastore.list_splits(query).await.unwrap();
         assert!(split.is_empty());
 
         // not empty
-        let split = metastore
-            .list_splits(index_id, SplitState::Staged, None, None)
-            .await
-            .unwrap();
+        let query = ListSplitsQuery::for_index(index_id).with_split_state(SplitState::Staged);
+        let split = metastore.list_splits(query).await.unwrap();
         assert!(!split.is_empty());
     }
 
@@ -822,8 +796,8 @@ mod tests {
     async fn test_file_backed_metastore_wrt_directly_visible() -> crate::MetastoreResult<()> {
         let metastore = FileBackedMetastore::default_for_test().await;
         let index_id = "test-index";
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
-        metastore.create_index(index_metadata).await?;
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
+        metastore.create_index(index_config).await?;
 
         assert!(metastore.list_all_splits(index_id).await?.is_empty());
         let split_metadata = SplitMetadata {
@@ -835,7 +809,9 @@ mod tests {
             ..Default::default()
         };
         assert!(metastore.list_all_splits("test-index").await?.is_empty());
-        metastore.stage_split(index_id, split_metadata).await?;
+        metastore
+            .stage_splits(index_id, vec![split_metadata])
+            .await?;
         assert_eq!(metastore.list_all_splits(index_id).await?.len(), 1);
         Ok(())
     }
@@ -853,8 +829,8 @@ mod tests {
             .unwrap();
 
         let index_id = "test-index";
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
-        metastore_wrt.create_index(index_metadata).await?;
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
+        metastore_wrt.create_index(index_config).await?;
 
         assert!(metastore_wrt.list_all_splits(index_id).await?.is_empty());
         let split_metadata = SplitMetadata {
@@ -869,7 +845,9 @@ mod tests {
             .list_all_splits("test-index")
             .await?
             .is_empty());
-        metastore_wrt.stage_split(index_id, split_metadata).await?;
+        metastore_wrt
+            .stage_splits(index_id, vec![split_metadata])
+            .await?;
         assert!(metastore_read
             .list_all_splits("test-index")
             .await?
@@ -892,10 +870,10 @@ mod tests {
         let metastore = Arc::new(FileBackedMetastore::default_for_test().await);
         let index_id = "test-index";
 
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
 
         // Create index
-        metastore.create_index(index_metadata).await.unwrap();
+        metastore.create_index(index_config).await.unwrap();
 
         // Stage splits in multiple threads
         let mut handles = Vec::new();
@@ -916,7 +894,7 @@ mod tests {
                 };
                 // stage split
                 metastore
-                    .stage_split(index_id, split_metadata)
+                    .stage_splits(index_id, vec![split_metadata])
                     .await
                     .unwrap();
 
@@ -934,10 +912,8 @@ mod tests {
 
         futures::future::try_join_all(handles).await.unwrap();
 
-        let splits = metastore
-            .list_splits(index_id, SplitState::Published, None, None)
-            .await
-            .unwrap();
+        let query = ListSplitsQuery::for_index(index_id).with_split_state(SplitState::Published);
+        let splits = metastore.list_splits(query).await.unwrap();
 
         // Make sure that all 20 splits are in `Published` state.
         assert_eq!(splits.len(), 20);
@@ -963,10 +939,10 @@ mod tests {
             .times(1)
             .returning(move |path| block_on(ram_storage.get_all(path)));
         let metastore = FileBackedMetastore::for_test(Arc::new(mock_storage));
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
 
         // Create index.
-        let metastore_error = metastore.create_index(index_metadata).await.unwrap_err();
+        let metastore_error = metastore.create_index(index_config).await.unwrap_err();
         assert!(matches!(
             metastore_error,
             MetastoreError::InternalError { .. }
@@ -1008,10 +984,10 @@ mod tests {
             .times(1)
             .returning(move |path| block_on(ram_storage.get_all(path)));
         let metastore = FileBackedMetastore::for_test(Arc::new(mock_storage));
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
 
         // Create index
-        let metastore_error = metastore.create_index(index_metadata).await.unwrap_err();
+        let metastore_error = metastore.create_index(index_config).await.unwrap_err();
         assert!(matches!(
             metastore_error,
             MetastoreError::InternalError { .. }
@@ -1078,10 +1054,10 @@ mod tests {
                 return block_on(ram_storage_clone.put(path, put_payload));
             });
         let metastore = FileBackedMetastore::for_test(Arc::new(mock_storage));
-        let index_metadata = IndexMetadata::for_test(index_id, "ram:///indexes/test-index");
+        let index_config = IndexConfig::for_test(index_id, "ram:///indexes/test-index");
 
         // Create index
-        let metastore_error = metastore.create_index(index_metadata).await.unwrap_err();
+        let metastore_error = metastore.create_index(index_config).await.unwrap_err();
         assert!(matches!(
             metastore_error,
             MetastoreError::InternalError { .. }
@@ -1264,11 +1240,11 @@ mod tests {
             .await
             .unwrap();
         let index_id = "test-index-increasing-stamps-by-index";
-        let index_metadata = IndexMetadata::for_test(
+        let index_config = IndexConfig::for_test(
             index_id,
             "ram:///indexes/test-index-increasing-stamps-by-index",
         );
-        metastore.create_index(index_metadata).await.unwrap();
+        metastore.create_index(index_config).await.unwrap();
         let delete_query = DeleteQuery {
             start_timestamp: None,
             end_timestamp: None,
@@ -1300,11 +1276,11 @@ mod tests {
 
         // Create delete tasks on new index.
         let index_id_2 = "test-index-increasing-stamps-by-index-2";
-        let index_metadata = IndexMetadata::for_test(
+        let index_config = IndexConfig::for_test(
             index_id_2,
             "ram:///indexes/test-index-increasing-stamps-by-index-2",
         );
-        metastore.create_index(index_metadata).await.unwrap();
+        metastore.create_index(index_config).await.unwrap();
         let delete_query = DeleteQuery {
             start_timestamp: None,
             end_timestamp: None,

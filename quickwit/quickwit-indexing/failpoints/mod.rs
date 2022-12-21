@@ -48,7 +48,8 @@ use quickwit_indexing::actors::MergeExecutor;
 use quickwit_indexing::merge_policy::MergeOperation;
 use quickwit_indexing::models::{IndexingPipelineId, MergeScratch, ScratchDirectory};
 use quickwit_indexing::{get_tantivy_directory_from_split_bundle, TestSandbox};
-use quickwit_metastore::{Split, SplitMetadata, SplitState};
+use quickwit_metastore::{ListSplitsQuery, Split, SplitMetadata, SplitState};
+use serde_json::Value as JsonValue;
 use tantivy::{Directory, Inventory};
 
 #[tokio::test]
@@ -160,36 +161,26 @@ async fn aux_test_failpoints() -> anyhow::Result<()> {
           - name: body
             type: text
           - name: ts
-            type: i64
+            type: datetime
             fast: true
-        "#;
-    let indexing_setting_yaml = r#"
         timestamp_field: ts
-    "#;
+        "#;
     let search_fields = ["body"];
     let index_id = append_random_suffix("test-index");
-    let test_index_builder = TestSandbox::create(
-        &index_id,
-        doc_mapper_yaml,
-        indexing_setting_yaml,
-        &search_fields,
-        None,
-    )
-    .await?;
-    let batch_1: Vec<serde_json::Value> = vec![
+    let test_index_builder =
+        TestSandbox::create(&index_id, doc_mapper_yaml, "", &search_fields).await?;
+    let batch_1: Vec<JsonValue> = vec![
         serde_json::json!({"body ": "1", "ts": 1629889530 }),
         serde_json::json!({"body ": "2", "ts": 1629889531 }),
     ];
-    let batch_2: Vec<serde_json::Value> = vec![
+    let batch_2: Vec<JsonValue> = vec![
         serde_json::json!({"body ": "3", "ts": 1629889532 }),
         serde_json::json!({"body ": "4", "ts": 1629889533 }),
     ];
     test_index_builder.add_documents(batch_1).await?;
     test_index_builder.add_documents(batch_2).await?;
-    let mut splits = test_index_builder
-        .metastore()
-        .list_splits(&index_id, SplitState::Published, None, None)
-        .await?;
+    let query = ListSplitsQuery::for_index(&index_id).with_split_state(SplitState::Published);
+    let mut splits = test_index_builder.metastore().list_splits(query).await?;
     splits.sort_by_key(|split| *split.split_metadata.time_range.clone().unwrap().start());
     assert_eq!(splits.len(), 2);
     assert_eq!(
@@ -230,11 +221,11 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
           - name: body
             type: text
           - name: ts
-            type: i64
+            type: datetime
             fast: true
+        timestamp_field: ts
         "#;
     let indexing_setting_yaml = r#"
-        timestamp_field: ts
         split_num_docs_target: 1000
     "#;
     let search_fields = ["body"];
@@ -244,12 +235,11 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
         doc_mapper_yaml,
         indexing_setting_yaml,
         &search_fields,
-        None,
     )
     .await?;
 
     let doc_mapper = test_index_builder.doc_mapper();
-    let batch: Vec<serde_json::Value> =
+    let batch: Vec<JsonValue> =
         std::iter::repeat_with(|| serde_json::json!({"body ": TEST_TEXT, "ts": 1631072713 }))
             .take(500)
             .collect();
@@ -263,7 +253,7 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
         .into_iter()
         .map(|split| split.split_metadata)
         .collect();
-    let merge_scratch_directory = ScratchDirectory::for_test()?;
+    let merge_scratch_directory = ScratchDirectory::for_test();
 
     let downloaded_splits_directory =
         merge_scratch_directory.named_temp_child("downloaded-splits-")?;

@@ -17,8 +17,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-pub mod otlp;
+#![deny(clippy::disallowed_methods)]
 
-pub async fn start_otlp_service() -> anyhow::Result<()> {
-    Ok(())
-}
+pub mod otlp;

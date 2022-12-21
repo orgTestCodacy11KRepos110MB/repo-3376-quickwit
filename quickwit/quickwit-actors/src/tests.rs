@@ -275,15 +275,15 @@ async fn test_timeouting_actor() {
     );
     assert!(buggy_mailbox.send_message(Block).await.is_ok());
 
-    assert_eq!(buggy_handle.health(), Health::Healthy);
+    assert_eq!(buggy_handle.harvest_health(), Health::Healthy);
     assert_eq!(
         buggy_handle.process_pending_and_observe().await.obs_type,
         ObservationType::Timeout
     );
-    assert_eq!(buggy_handle.health(), Health::Healthy);
+    assert_eq!(buggy_handle.harvest_health(), Health::Healthy);
     tokio::time::sleep(crate::HEARTBEAT).await;
     tokio::time::sleep(crate::HEARTBEAT).await;
-    assert_eq!(buggy_handle.health(), Health::FailureOrUnhealthy);
+    assert_eq!(buggy_handle.harvest_health(), Health::FailureOrUnhealthy);
 }
 
 #[tokio::test]
@@ -512,6 +512,10 @@ struct Adder(u64);
 
 impl Actor for Adder {
     type ObservableState = u64;
+
+    fn yield_after_each_message(&self) -> bool {
+        false
+    }
 
     fn observable_state(&self) -> Self::ObservableState {
         self.0

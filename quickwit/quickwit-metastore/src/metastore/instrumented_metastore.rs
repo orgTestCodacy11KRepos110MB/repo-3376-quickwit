@@ -17,16 +17,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::ops::Range;
-
 use async_trait::async_trait;
 use quickwit_common::uri::Uri;
-use quickwit_config::SourceConfig;
-use quickwit_doc_mapper::tag_pruning::TagFilterAst;
+use quickwit_config::{IndexConfig, SourceConfig};
 use quickwit_proto::metastore_api::{DeleteQuery, DeleteTask};
 
 use crate::checkpoint::IndexCheckpointDelta;
-use crate::{IndexMetadata, Metastore, MetastoreResult, Split, SplitMetadata, SplitState};
+use crate::{IndexMetadata, ListSplitsQuery, Metastore, MetastoreResult, Split, SplitMetadata};
 
 macro_rules! instrument {
     ($expr:expr, [$operation:ident, $($label:expr),*]) => {
@@ -87,11 +84,11 @@ impl Metastore for InstrumentedMetastore {
 
     // Index API
 
-    async fn create_index(&self, index_metadata: IndexMetadata) -> MetastoreResult<()> {
-        let index_id = index_metadata.index_id.clone();
+    async fn create_index(&self, index_config: IndexConfig) -> MetastoreResult<()> {
+        let index_id = index_config.index_id.to_string();
         instrument!(
-            self.underlying.create_index(index_metadata).await,
-            [create_index, index_id.as_ref()]
+            self.underlying.create_index(index_config).await,
+            [create_index, index_id.as_str()]
         );
     }
 
@@ -125,14 +122,16 @@ impl Metastore for InstrumentedMetastore {
 
     // Split API
 
-    async fn stage_split(
+    async fn stage_splits(
         &self,
         index_id: &str,
-        split_metadata: SplitMetadata,
+        split_metadata_list: Vec<SplitMetadata>,
     ) -> MetastoreResult<()> {
         instrument!(
-            self.underlying.stage_split(index_id, split_metadata).await,
-            [stage_split, index_id]
+            self.underlying
+                .stage_splits(index_id, split_metadata_list)
+                .await,
+            [stage_splits, index_id]
         );
     }
 
@@ -156,17 +155,10 @@ impl Metastore for InstrumentedMetastore {
         );
     }
 
-    async fn list_splits(
-        &self,
-        index_id: &str,
-        split_state: SplitState,
-        time_range: Option<Range<i64>>,
-        tags: Option<TagFilterAst>,
-    ) -> MetastoreResult<Vec<Split>> {
+    async fn list_splits<'a>(&self, query: ListSplitsQuery<'a>) -> MetastoreResult<Vec<Split>> {
+        let index_id = query.index_id;
         instrument!(
-            self.underlying
-                .list_splits(index_id, split_state, time_range, tags)
-                .await,
+            self.underlying.list_splits(query).await,
             [list_splits, index_id]
         );
     }
@@ -245,7 +237,7 @@ impl Metastore for InstrumentedMetastore {
         );
     }
 
-    // Delete tasks API
+    // Delete task API
     async fn create_delete_task(&self, delete_query: DeleteQuery) -> MetastoreResult<DeleteTask> {
         let index_id = delete_query.index_id.clone();
         instrument!(

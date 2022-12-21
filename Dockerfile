@@ -2,6 +2,14 @@ FROM rust:bullseye AS builder
 
 ARG CARGO_FEATURES=release-feature-set
 ARG CARGO_PROFILE=release
+ARG QW_COMMIT_DATE
+ARG QW_COMMIT_HASH
+ARG QW_COMMIT_TAGS
+
+ENV QW_COMMIT_DATE=$QW_COMMIT_DATE
+ENV QW_COMMIT_HASH=$QW_COMMIT_HASH
+ENV QW_COMMIT_TAGS=$QW_COMMIT_TAGS
+
 
 RUN echo "Adding Node.js PPA" \
     && curl -s https://deb.nodesource.com/setup_16.x | bash
@@ -11,7 +19,6 @@ RUN apt-get -y update \
                           clang \
                           cmake \
                           libssl-dev \
-                          libsasl2-dev \
                           llvm \
                           nodejs \
                           protobuf-compiler \
@@ -55,7 +62,6 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 RUN apt-get -y update \
     && apt-get -y install ca-certificates \
-                          libsasl2-2 \
                           libssl1.1 \
     && rm -rf /var/lib/apt/lists/*
 

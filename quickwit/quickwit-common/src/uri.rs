@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize, Serializer};
 pub enum Protocol {
     Azure,
     File,
+    Grpc,
     PostgreSQL,
     Ram,
     S3,
@@ -45,6 +46,7 @@ impl Protocol {
         match &self {
             Protocol::Azure => "azure",
             Protocol::File => "file",
+            Protocol::Grpc => "grpc",
             Protocol::PostgreSQL => "postgresql",
             Protocol::Ram => "ram",
             Protocol::S3 => "s3",
@@ -57,6 +59,10 @@ impl Protocol {
 
     pub fn is_file(&self) -> bool {
         matches!(&self, Protocol::File)
+    }
+
+    pub fn is_grpc(&self) -> bool {
+        matches!(&self, Protocol::Grpc)
     }
 
     pub fn is_postgresql(&self) -> bool {
@@ -97,6 +103,7 @@ impl FromStr for Protocol {
         match protocol {
             "azure" => Ok(Protocol::Azure),
             "file" => Ok(Protocol::File),
+            "grpc" => Ok(Protocol::Grpc),
             "postgres" | "postgresql" => Ok(Protocol::PostgreSQL),
             "ram" => Ok(Protocol::Ram),
             "s3" => Ok(Protocol::S3),
@@ -106,26 +113,6 @@ impl FromStr for Protocol {
 }
 
 const PROTOCOL_SEPARATOR: &str = "://";
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum Extension {
-    Json,
-    Toml,
-    Unknown(String),
-    Yaml,
-}
-
-impl Extension {
-    fn maybe_new(extension: &str) -> Option<Self> {
-        match extension {
-            "json" => Some(Self::Json),
-            "toml" => Some(Self::Toml),
-            "yaml" | "yml" => Some(Self::Yaml),
-            "" => None,
-            unknown => Some(Self::Unknown(unknown.to_string())),
-        }
-    }
-}
 
 /// Encapsulates the URI type.
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -137,7 +124,8 @@ pub struct Uri {
 impl Uri {
     /// Constructs a [`Uri`] from a properly formatted string `<protocol>://<path>` where `path` is
     /// normalized. Use this method exclusively for trusted input.
-    pub fn from_well_formed(uri: String) -> Self {
+    pub fn from_well_formed<S: ToString>(uri: S) -> Self {
+        let uri = uri.to_string();
         let protocol_idx = uri.find(PROTOCOL_SEPARATOR).expect(
             "URI lacks protocol separator. Use `Uri::from_well_formed` exclusively for trusted \
              input.",
@@ -151,15 +139,12 @@ impl Uri {
 
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test(uri: &str) -> Self {
-        Uri::from_well_formed(uri.to_string())
+        Uri::from_well_formed(uri)
     }
 
     /// Returns the extension of the URI.
-    pub fn extension(&self) -> Option<Extension> {
-        Path::new(&self.uri)
-            .extension()
-            .and_then(OsStr::to_str)
-            .and_then(Extension::maybe_new)
+    pub fn extension(&self) -> Option<&str> {
+        Path::new(&self.uri).extension().and_then(OsStr::to_str)
     }
 
     /// Returns the URI as a string slice.
@@ -365,7 +350,7 @@ impl PartialEq<String> for Uri {
 impl<'de> Deserialize<'de> for Uri {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: serde::Deserializer<'de> {
-        let uri_str: String = Deserialize::deserialize(deserializer)?;
+        let uri_str: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
         let uri = Uri::from_str(&uri_str).map_err(D::Error::custom)?;
         Ok(uri)
     }
@@ -523,11 +508,11 @@ mod tests {
 
         assert_eq!(
             Uri::for_test("s3://config.json").extension().unwrap(),
-            Extension::Json
+            "json"
         );
         assert_eq!(
             Uri::for_test("azure://config.foo").extension().unwrap(),
-            Extension::Unknown("foo".to_string())
+            "foo"
         );
     }
 

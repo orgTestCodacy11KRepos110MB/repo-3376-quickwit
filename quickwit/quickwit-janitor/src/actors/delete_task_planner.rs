@@ -422,18 +422,21 @@ mod tests {
                 type: i64
                 fast: true
         "#;
-        let test_sandbox =
-            TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"], None).await?;
-        let docs = vec![
+        let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
+        let docs = [
             serde_json::json!({"body": "info", "ts": 0 }),
             serde_json::json!({"body": "info", "ts": 0 }),
             serde_json::json!({"body": "delete", "ts": 0 }),
         ];
+        // Creates 3 splits
         for doc in docs {
             test_sandbox.add_documents(vec![doc]).await?;
         }
         let metastore = test_sandbox.metastore();
-        let index_metadata = metastore.index_metadata(index_id).await?;
+        let index_config = metastore
+            .index_metadata(index_id)
+            .await?
+            .into_index_config();
         let split_metas: Vec<SplitMetadata> = metastore
             .list_all_splits(index_id)
             .await?
@@ -441,11 +444,8 @@ mod tests {
             .map(|split| split.split_metadata)
             .collect_vec();
         assert_eq!(split_metas.len(), 3);
-        let doc_mapper = build_doc_mapper(
-            &index_metadata.doc_mapping,
-            &index_metadata.search_settings,
-            &index_metadata.indexing_settings,
-        )?;
+        let doc_mapper =
+            build_doc_mapper(&index_config.doc_mapping, &index_config.search_settings)?;
         let doc_mapper_str = serde_json::to_string(&doc_mapper)?;
 
         // Creates 2 delete tasks, one that will match 1 document,
@@ -496,7 +496,7 @@ mod tests {
         let (downloader_mailbox, downloader_inbox) = create_test_mailbox();
         let delete_planner_executor = DeleteTaskPlanner::new(
             index_id.to_string(),
-            index_metadata.index_uri,
+            index_config.index_uri.clone(),
             doc_mapper_str,
             metastore.clone(),
             client_pool,
@@ -507,8 +507,8 @@ mod tests {
         let (delete_planner_mailbox, delete_planner_handle) =
             universe.spawn_builder().spawn(delete_planner_executor);
         delete_planner_handle.process_pending_and_observe().await;
-        let downloader_msgs =
-            downloader_inbox.drain_for_test_typed::<TrackedObject<MergeOperation>>();
+        let downloader_msgs: Vec<TrackedObject<MergeOperation>> =
+            downloader_inbox.drain_for_test_typed();
         assert_eq!(downloader_msgs.len(), 1);
         // The last split will undergo a delete operation.
         assert_eq!(
@@ -523,7 +523,7 @@ mod tests {
         );
         // Trigger new plan evaluation and check that we don't have new merge operation.
         delete_planner_mailbox
-            .send_message(PlanDeleteOperations)
+            .ask(PlanDeleteOperations)
             .await
             .unwrap();
         assert!(downloader_inbox.drain_for_test().is_empty());
@@ -539,7 +539,7 @@ mod tests {
 
         // Trigger operations planning.
         delete_planner_mailbox
-            .send_message(PlanDeleteOperations)
+            .ask(PlanDeleteOperations)
             .await
             .unwrap();
         let downloader_last_msgs =

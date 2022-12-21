@@ -24,12 +24,14 @@ use anyhow::Context;
 use quickwit_config::service::QuickwitService;
 use quickwit_jaeger::JaegerService;
 use quickwit_metastore::GrpcMetastoreAdapter;
-use quickwit_opentelemetry::otlp::OtlpGrpcTraceService;
+use quickwit_opentelemetry::otlp::{OtlpGrpcLogsService, OtlpGrpcTraceService};
 use quickwit_proto::jaeger::storage::v1::span_reader_plugin_server::SpanReaderPluginServer;
 use quickwit_proto::metastore_api::metastore_api_service_server::MetastoreApiServiceServer;
+use quickwit_proto::opentelemetry::proto::collector::logs::v1::logs_service_server::LogsServiceServer;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::trace_service_server::TraceServiceServer;
 use quickwit_proto::search_service_server::SearchServiceServer;
 use quickwit_proto::tonic;
+use quickwit_proto::tonic::codegen::CompressionEncoding;
 use tonic::transport::Server;
 use tracing::*;
 
@@ -66,9 +68,23 @@ pub(crate) async fn start_grpc_server(
             .ingest_api_service
             .clone()
             .context("Failed to instantiate OTLP trace service: the ingest API is disabled.")?;
-        Some(TraceServiceServer::new(OtlpGrpcTraceService::new(
-            ingest_api_service,
-        )))
+        let trace_service = TraceServiceServer::new(OtlpGrpcTraceService::new(ingest_api_service))
+            .accept_compressed(CompressionEncoding::Gzip);
+        Some(trace_service)
+    } else {
+        None
+    };
+    let otlp_log_service = if enable_opentelemetry_otlp_service
+        && services.services.contains(&QuickwitService::Indexer)
+    {
+        enabled_grpc_services.insert("otlp-log");
+        let ingest_api_service = services
+            .ingest_api_service
+            .clone()
+            .context("Failed to instantiate OTLP log service: the ingest API is disabled.")?;
+        let logs_service = LogsServiceServer::new(OtlpGrpcLogsService::new(ingest_api_service))
+            .accept_compressed(CompressionEncoding::Gzip);
+        Some(logs_service)
     } else {
         None
     };
@@ -92,8 +108,10 @@ pub(crate) async fn start_grpc_server(
         } else {
             None
         };
+
     let server_router = server
         .add_optional_service(metastore_service)
+        .add_optional_service(otlp_log_service)
         .add_optional_service(otlp_trace_service)
         .add_optional_service(search_service)
         .add_optional_service(jaeger_service);

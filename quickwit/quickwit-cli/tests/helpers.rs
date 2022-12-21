@@ -24,18 +24,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::bail;
-use assert_cmd::Command;
 use predicates::str;
 use quickwit_common::net::find_available_tcp_port;
 use quickwit_common::uri::Uri;
-use quickwit_metastore::{FileBackedMetastore, MetastoreResult};
+use quickwit_metastore::{FileBackedMetastore, IndexMetadata, Metastore, MetastoreResult};
 use quickwit_storage::{LocalFileStorage, S3CompatibleObjectStorage, Storage};
 use tempfile::{tempdir, TempDir};
 
-const PACKAGE_BIN_NAME: &str = "quickwit";
+pub const PACKAGE_BIN_NAME: &str = "quickwit";
 
 const DEFAULT_INDEX_CONFIG: &str = r#"
-    version: 0
+    version: 0.4
 
     index_id: #index_id
     index_uri: #index_uri
@@ -43,7 +42,11 @@ const DEFAULT_INDEX_CONFIG: &str = r#"
     doc_mapping:
       field_mappings:
         - name: ts
-          type: i64
+          type: datetime
+          input_formats:
+            - unix_timestamp
+          output_format: unix_timestamp_secs
+          precision: seconds
           fast: true
         - name: level
           type: text
@@ -59,10 +62,10 @@ const DEFAULT_INDEX_CONFIG: &str = r#"
           stored: false
           tokenizer: raw
 
+      timestamp_field: ts
       tag_fields: [city, device]
 
     indexing_settings:
-      timestamp_field: ts
       resources:
         heap_size: 50MB
 
@@ -71,18 +74,18 @@ const DEFAULT_INDEX_CONFIG: &str = r#"
 "#;
 
 const DEFAULT_QUICKWIT_CONFIG: &str = r#"
-    version: 0
+    version: 0.4
     metastore_uri: #metastore_uri
     data_dir: #data_dir
     rest_listen_port: #rest_listen_port
     grpc_listen_port: #grpc_listen_port
 "#;
 
-const LOGS_JSON_DOCS: &str = r#"{"event": "foo", "level": "info", "ts": 2, "device": "rpi", "city": "tokio"}
-{"event": "bar", "level": "error", "ts": 3, "device": "rpi", "city": "paris"}
-{"event": "baz", "level": "warning", "ts": 9, "device": "fbit", "city": "london"}
-{"event": "buz", "level": "debug", "ts": 12, "device": "rpi", "city": "paris"}
-{"event": "biz", "level": "info", "ts": 13, "device": "fbit", "city": "paris"}"#;
+const LOGS_JSON_DOCS: &str = r#"{"event": "foo", "level": "info", "ts": 72057597, "device": "rpi", "city": "tokio"}
+{"event": "bar", "level": "error", "ts": 72057598, "device": "rpi", "city": "paris"}
+{"event": "baz", "level": "warning", "ts": 72057604, "device": "fbit", "city": "london"}
+{"event": "buz", "level": "debug", "ts": 72057607, "device": "rpi", "city": "paris"}
+{"event": "biz", "level": "info", "ts": 72057608, "device": "fbit", "city": "paris"}"#;
 
 const WIKI_JSON_DOCS: &str = r#"{"body": "foo", "title": "shimroy", "url": "https://wiki.com?id=10"}
 {"body": "bar", "title": "shimray", "url": "https://wiki.com?id=12"}
@@ -90,17 +93,6 @@ const WIKI_JSON_DOCS: &str = r#"{"body": "foo", "title": "shimroy", "url": "http
 {"body": "buz", "title": "frederick", "url": "https://wiki.com?id=48"}
 {"body": "biz", "title": "modern", "url": "https://wiki.com?id=13"}
 "#;
-
-/// Creates a quickwit-cli command with provided list of arguments.
-pub fn make_command(arguments: &str) -> Command {
-    let mut cmd = Command::cargo_bin(PACKAGE_BIN_NAME).unwrap();
-    cmd.env(
-        quickwit_telemetry::DISABLE_TELEMETRY_ENV_KEY,
-        "disable-for-tests",
-    )
-    .args(arguments.split_whitespace());
-    cmd
-}
 
 /// Waits until localhost:port is ready. Returns an error if it takes too long.
 pub async fn wait_port_ready(port: u16) -> anyhow::Result<()> {
@@ -148,6 +140,21 @@ impl TestEnv {
     // For cache reason, it's safer to always create an instance and then make your assertions.
     pub async fn metastore(&self) -> MetastoreResult<FileBackedMetastore> {
         FileBackedMetastore::try_new(self.storage.clone(), None).await
+    }
+
+    pub fn index_config_without_uri(&self) -> String {
+        self.resource_files["index_config_without_uri"]
+            .display()
+            .to_string()
+    }
+
+    pub async fn index_metadata(&self) -> anyhow::Result<IndexMetadata> {
+        let index_metadata = self
+            .metastore()
+            .await?
+            .index_metadata(&self.index_id)
+            .await?;
+        Ok(index_metadata)
     }
 }
 

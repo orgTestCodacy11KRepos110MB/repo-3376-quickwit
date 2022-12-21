@@ -11,4 +11,6 @@ jobs:
       - name: "Checkout Repository"
         uses: actions/checkout@v3
       - name: "Dependency Review"
-        uses: actions/dependency-review-action@v2
+        uses: actions/dependency-review-action@v3
+        with:
+          allow-ghsas: GHSA-xpp3-xrff-w6rh # this refers to a RocksDB vulnerability on an API we do not use.

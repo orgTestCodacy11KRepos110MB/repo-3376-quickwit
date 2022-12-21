@@ -26,12 +26,13 @@ use quickwit_actors::{
     HEARTBEAT,
 };
 use quickwit_common::io::IoControls;
+use quickwit_common::uri::Uri;
 use quickwit_config::{build_doc_mapper, IndexingSettings};
 use quickwit_indexing::actors::{
     MergeExecutor, MergeSplitDownloader, Packager, Publisher, Uploader, UploaderType,
 };
 use quickwit_indexing::merge_policy::merge_policy_from_settings;
-use quickwit_indexing::models::{IndexingDirectory, IndexingPipelineId};
+use quickwit_indexing::models::{IndexingPipelineId, ScratchDirectory};
 use quickwit_indexing::{IndexingSplitStore, PublisherType, SplitsUpdateMailbox};
 use quickwit_metastore::Metastore;
 use quickwit_search::SearchClientPool;
@@ -140,7 +141,11 @@ impl DeleteTaskPipeline {
             root_dir=%self.delete_service_dir_path.display(),
             "Spawning delete tasks pipeline.",
         );
-        let index_metadata = self.metastore.index_metadata(&self.index_id).await?;
+        let index_config = self
+            .metastore
+            .index_metadata(&self.index_id)
+            .await?
+            .into_index_config();
         let publisher = Publisher::new(
             PublisherType::MergePublisher,
             self.metastore.clone(),
@@ -160,11 +165,8 @@ impl DeleteTaskPipeline {
         );
         let (uploader_mailbox, uploader_supervisor_handler) = ctx.spawn_actor().supervise(uploader);
 
-        let doc_mapper = build_doc_mapper(
-            &index_metadata.doc_mapping,
-            &index_metadata.search_settings,
-            &index_metadata.indexing_settings,
-        )?;
+        let doc_mapper =
+            build_doc_mapper(&index_config.doc_mapping, &index_config.search_settings)?;
         let tag_fields = doc_mapper.tag_named_fields()?;
         let packager = Packager::new("MergePackager", tag_fields, uploader_mailbox);
         let (packager_mailbox, packager_supervisor_handler) = ctx.spawn_actor().supervise(packager);
@@ -174,10 +176,10 @@ impl DeleteTaskPipeline {
             pipeline_ord: 0,
             source_id: "unknown".to_string(),
         };
-        let throughput_limit: f64 = index_metadata
+        let throughput_limit: f64 = index_config
             .indexing_settings
             .resources
-            .max_janitor_write_throughput
+            .max_merge_write_throughput
             .as_ref()
             .map(|bytes_per_sec| bytes_per_sec.get_bytes() as f64)
             .unwrap_or(f64::INFINITY);
@@ -197,9 +199,9 @@ impl DeleteTaskPipeline {
         let (delete_executor_mailbox, task_executor_supervisor_handler) =
             ctx.spawn_actor().supervise(delete_executor);
         let indexing_directory_path = self.delete_service_dir_path.join(&self.index_id);
-        let indexing_directory = IndexingDirectory::create_in_dir(indexing_directory_path).await?;
+        let scratch_directory = ScratchDirectory::create_in_dir(indexing_directory_path).await?;
         let merge_split_downloader = MergeSplitDownloader {
-            scratch_directory: indexing_directory.scratch_directory().clone(),
+            scratch_directory,
             split_store: split_store.clone(),
             executor_mailbox: delete_executor_mailbox,
             io_controls: split_download_io_controls,
@@ -208,9 +210,10 @@ impl DeleteTaskPipeline {
             ctx.spawn_actor().supervise(merge_split_downloader);
         let merge_policy = merge_policy_from_settings(&self.indexing_settings);
         let doc_mapper_str = serde_json::to_string(&doc_mapper)?;
+        let index_uri: &Uri = &index_config.index_uri;
         let task_planner = DeleteTaskPlanner::new(
             self.index_id.clone(),
-            index_metadata.index_uri,
+            index_uri.clone(),
             doc_mapper_str,
             self.metastore.clone(),
             self.search_client_pool.clone(),
@@ -320,16 +323,9 @@ mod tests {
                 type: i64
                 fast: true
         "#;
-        let metastore_uri = "ram:///delete-pipeline";
-        let test_sandbox = TestSandbox::create(
-            index_id,
-            doc_mapping_yaml,
-            "{}",
-            &["body"],
-            Some(metastore_uri),
-        )
-        .await
-        .unwrap();
+        let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"])
+            .await
+            .unwrap();
         let docs = vec![
             serde_json::json!({"body": "info", "ts": 0 }),
             serde_json::json!({"body": "info", "ts": 0 }),
@@ -421,16 +417,9 @@ mod tests {
                 type: i64
                 fast: true
         "#;
-        let metastore_uri = "ram:///delete-pipeline";
-        let test_sandbox = TestSandbox::create(
-            index_id,
-            doc_mapping_yaml,
-            "{}",
-            &["body"],
-            Some(metastore_uri),
-        )
-        .await
-        .unwrap();
+        let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"])
+            .await
+            .unwrap();
         let metastore = test_sandbox.metastore();
         let mut mock_search_service = MockSearchService::new();
         mock_search_service

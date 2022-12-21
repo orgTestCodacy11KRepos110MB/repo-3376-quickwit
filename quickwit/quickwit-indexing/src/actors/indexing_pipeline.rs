@@ -42,7 +42,7 @@ use crate::actors::publisher::PublisherType;
 use crate::actors::sequencer::Sequencer;
 use crate::actors::uploader::UploaderType;
 use crate::actors::{Indexer, Packager, Publisher, Uploader};
-use crate::models::{IndexingDirectory, IndexingPipelineId, IndexingStatistics, Observe};
+use crate::models::{IndexingPipelineId, IndexingStatistics, Observe, ScratchDirectory};
 use crate::source::{quickwit_supported_sources, SourceActor, SourceExecutionContext};
 use crate::split_store::IndexingSplitStore;
 use crate::SplitsUpdateMailbox;
@@ -184,7 +184,7 @@ impl IndexingPipeline {
         let mut failure_or_unhealthy_actors: Vec<&str> = Default::default();
         let mut success_actors: Vec<&str> = Default::default();
         for supervisable in self.supervisables() {
-            match supervisable.health() {
+            match supervisable.harvest_health() {
                 Health::Healthy => {
                     // At least one other actor is running.
                     healthy_actors.push(supervisable.name());
@@ -246,10 +246,12 @@ impl IndexingPipeline {
     async fn spawn_pipeline(&mut self, ctx: &ActorContext<Self>) -> anyhow::Result<()> {
         let _spawn_pipeline_permit = SPAWN_PIPELINE_SEMAPHORE.acquire().await.expect("Failed to acquire spawn pipeline permit. This should never happen! Please, report on https://github.com/quickwit-oss/quickwit/issues.");
         self.statistics.num_spawn_attempts += 1;
+        let index_id = self.params.pipeline_id.index_id.as_str();
+        let source_id = self.params.pipeline_id.source_id.as_str();
         self.kill_switch = ctx.kill_switch().child();
         info!(
-            index_id=%self.params.pipeline_id.index_id,
-            source_id=%self.params.pipeline_id.source_id,
+            index_id=%index_id,
+            source_id=%source_id,
             pipeline_ord=%self.params.pipeline_id.pipeline_ord,
             root_dir=%self.params.indexing_directory.path().display(),
             "Spawning indexing pipeline.",
@@ -267,11 +269,21 @@ impl IndexingPipeline {
         let (publisher_mailbox, publisher_handler) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
+            .set_backpressure_micros_counter(
+                crate::metrics::INDEXER_METRICS
+                    .backpressure_micros
+                    .with_label_values([index_id, "Publisher"]),
+            )
             .spawn(publisher);
 
         let sequencer = Sequencer::new(publisher_mailbox);
         let (sequencer_mailbox, sequencer_handler) = ctx
             .spawn_actor()
+            .set_backpressure_micros_counter(
+                crate::metrics::INDEXER_METRICS
+                    .backpressure_micros
+                    .with_label_values([index_id, "Sequencer"]),
+            )
             .set_kill_switch(self.kill_switch.clone())
             .spawn(sequencer);
 
@@ -285,6 +297,11 @@ impl IndexingPipeline {
         );
         let (uploader_mailbox, uploader_handler) = ctx
             .spawn_actor()
+            .set_backpressure_micros_counter(
+                crate::metrics::INDEXER_METRICS
+                    .backpressure_micros
+                    .with_label_values([index_id, "Uploader"]),
+            )
             .set_kill_switch(self.kill_switch.clone())
             .spawn(uploader);
 
@@ -314,12 +331,17 @@ impl IndexingPipeline {
         );
         let (indexer_mailbox, indexer_handler) = ctx
             .spawn_actor()
+            .set_backpressure_micros_counter(
+                crate::metrics::INDEXER_METRICS
+                    .backpressure_micros
+                    .with_label_values([index_id, "Indexer"]),
+            )
             .set_kill_switch(self.kill_switch.clone())
             .spawn(indexer);
 
         let doc_processor = DocProcessor::new(
-            self.params.pipeline_id.index_id.clone(),
-            self.params.pipeline_id.source_id.clone(),
+            index_id.to_string(),
+            source_id.to_string(),
             self.params.doc_mapper.clone(),
             indexer_mailbox,
         );
@@ -329,18 +351,14 @@ impl IndexingPipeline {
             .spawn(doc_processor);
 
         // Fetch index_metadata to be sure to have the last updated checkpoint.
-        let index_metadata = self
-            .params
-            .metastore
-            .index_metadata(&self.params.pipeline_id.index_id)
-            .await?;
+        let index_metadata = self.params.metastore.index_metadata(index_id).await?;
         let source_checkpoint = index_metadata
             .checkpoint
-            .source_checkpoint(&self.params.pipeline_id.source_id)
+            .source_checkpoint(source_id)
             .cloned()
             .unwrap_or_default(); // TODO Have a stricter check.
-        let source = quickwit_supported_sources()
-            .load_source(
+        let source = ctx
+            .protect_future(quickwit_supported_sources().load_source(
                 Arc::new(SourceExecutionContext {
                     metastore: self.params.metastore.clone(),
                     index_id: self.params.pipeline_id.index_id.clone(),
@@ -348,7 +366,7 @@ impl IndexingPipeline {
                     source_config: self.params.source_config.clone(),
                 }),
                 source_checkpoint,
-            )
+            ))
             .await?;
         let actor_source = SourceActor {
             source,
@@ -487,7 +505,7 @@ impl Handler<Spawn> for IndexingPipeline {
 pub struct IndexingPipelineParams {
     pub pipeline_id: IndexingPipelineId,
     pub doc_mapper: Arc<dyn DocMapper>,
-    pub indexing_directory: IndexingDirectory,
+    pub indexing_directory: ScratchDirectory,
     pub queues_dir_path: PathBuf,
     pub indexing_settings: IndexingSettings,
     pub source_config: SourceConfig,
@@ -513,7 +531,7 @@ mod tests {
     use super::{IndexingPipeline, *};
     use crate::actors::merge_pipeline::{MergePipeline, MergePipelineParams};
     use crate::merge_policy::default_merge_policy;
-    use crate::models::IndexingDirectory;
+    use crate::models::ScratchDirectory;
 
     #[test]
     fn test_wait_duration() {
@@ -553,7 +571,7 @@ mod tests {
             .expect_mark_splits_for_deletion()
             .returning(|_, _| Ok(()));
         metastore
-            .expect_stage_split()
+            .expect_stage_splits()
             .withf(|index_id, _metadata| -> bool { index_id == "test-index" })
             .times(1)
             .returning(|_, _| Ok(()));
@@ -595,7 +613,7 @@ mod tests {
             pipeline_id,
             doc_mapper: Arc::new(default_doc_mapper_for_test()),
             source_config,
-            indexing_directory: IndexingDirectory::for_test().await,
+            indexing_directory: ScratchDirectory::for_test(),
             indexing_settings: IndexingSettings::for_test(),
             metastore: metastore.clone(),
             storage,
@@ -644,7 +662,7 @@ mod tests {
                 Ok(10)
             });
         metastore
-            .expect_stage_split()
+            .expect_stage_splits()
             .withf(|index_id, _metadata| index_id == "test-index")
             .times(1)
             .returning(|_, _| Ok(()));
@@ -686,7 +704,7 @@ mod tests {
             pipeline_id,
             doc_mapper: Arc::new(default_doc_mapper_for_test()),
             source_config,
-            indexing_directory: IndexingDirectory::for_test().await,
+            indexing_directory: ScratchDirectory::for_test(),
             indexing_settings: IndexingSettings::for_test(),
             metastore: metastore.clone(),
             queues_dir_path: PathBuf::from("./queues"),
@@ -719,9 +737,7 @@ mod tests {
                     "ram:///indexes/test-index",
                 ))
             });
-        metastore
-            .expect_list_splits()
-            .returning(|_, _, _, _| Ok(Vec::new()));
+        metastore.expect_list_splits().returning(|_| Ok(Vec::new()));
         let universe = Universe::new();
         let node_id = "test-node";
         let metastore = Arc::new(metastore);
@@ -743,7 +759,7 @@ mod tests {
         let merge_pipeline_params = MergePipelineParams {
             pipeline_id: pipeline_id.clone(),
             doc_mapper: doc_mapper.clone(),
-            indexing_directory: IndexingDirectory::for_test().await,
+            indexing_directory: ScratchDirectory::for_test(),
             metastore: metastore.clone(),
             split_store: split_store.clone(),
             merge_policy: default_merge_policy(),
@@ -758,7 +774,7 @@ mod tests {
             pipeline_id,
             doc_mapper,
             source_config,
-            indexing_directory: IndexingDirectory::for_test().await,
+            indexing_directory: ScratchDirectory::for_test(),
             indexing_settings: IndexingSettings::for_test(),
             metastore: metastore.clone(),
             queues_dir_path: PathBuf::from("./queues"),
@@ -771,16 +787,22 @@ mod tests {
         let indexing_pipeline = IndexingPipeline::new(indexing_pipeline_params);
         let (_indexing_pipeline_mailbox, indexing_pipeline_handler) =
             universe.spawn_builder().spawn(indexing_pipeline);
-        assert_eq!(indexing_pipeline_handler.observe().await.generation, 1);
+        let obs = indexing_pipeline_handler
+            .process_pending_and_observe()
+            .await;
+        assert_eq!(obs.generation, 1);
         // Let's shutdown the indexer, this will trigger the the indexing pipeline failure and the
         // restart.
         let indexer = universe.get::<Indexer>().into_iter().next().unwrap();
         indexer.send_message(Command::Quit).await.unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
         // Check indexing pipeline has restarted.
-        assert_eq!(indexing_pipeline_handler.observe().await.generation, 2);
+        let obs = indexing_pipeline_handler
+            .process_pending_and_observe()
+            .await;
+        assert_eq!(obs.generation, 2);
         // Check that the merge pipeline is still up.
-        assert_eq!(merge_pipeline_handler.health(), Health::Healthy);
+        assert_eq!(merge_pipeline_handler.harvest_health(), Health::Healthy);
         Ok(())
     }
 }

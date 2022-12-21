@@ -30,22 +30,23 @@ use clap::{arg, ArgMatches, Command};
 use colored::{ColoredString, Colorize};
 use humantime::format_duration;
 use itertools::Itertools;
-use quickwit_actors::{ActorHandle, ObservationType, Universe};
+use quickwit_actors::{ActorExitStatus, ActorHandle, ObservationType, Universe};
 use quickwit_common::uri::Uri;
 use quickwit_common::GREEN_COLOR;
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{
-    IndexConfig, IndexerConfig, SourceConfig, SourceParams, CLI_INGEST_SOURCE_ID,
-    INGEST_API_SOURCE_ID,
+    ConfigFormat, IndexConfig, IndexerConfig, SourceConfig, SourceParams, VecSourceParams,
+    CLI_INGEST_SOURCE_ID, INGEST_API_SOURCE_ID,
 };
-use quickwit_core::{
-    clear_cache_directory, remove_indexing_directory, validate_storage_uri, IndexService,
-};
-use quickwit_indexing::actors::{IndexingPipeline, IndexingService};
+use quickwit_core::{clear_cache_directory, remove_indexing_directory, IndexService};
+use quickwit_indexing::actors::{IndexingService, MergePipeline, MergePipelineId};
 use quickwit_indexing::models::{
-    DetachPipeline, IndexingPipelineId, IndexingStatistics, SpawnMergePipeline, SpawnPipeline,
+    DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnPipeline,
 };
-use quickwit_metastore::{quickwit_metastore_uri_resolver, IndexMetadata, Split, SplitState};
+use quickwit_indexing::IndexingPipeline;
+use quickwit_metastore::{
+    quickwit_metastore_uri_resolver, IndexMetadata, ListSplitsQuery, Split, SplitState,
+};
 use quickwit_proto::{SearchRequest, SearchResponse};
 use quickwit_search::{single_node_search, SearchResponseRest};
 use quickwit_storage::{load_file, quickwit_storage_uri_resolver};
@@ -53,7 +54,7 @@ use quickwit_telemetry::payload::TelemetryEvent;
 use tabled::object::{Columns, Segment};
 use tabled::{Alignment, Concat, Format, Modify, Panel, Rotate, Style, Table, Tabled};
 use thousands::Separable;
-use tracing::{debug, warn, Level};
+use tracing::{debug, info, warn, Level};
 
 use crate::stats::{mean, percentile, std_deviation};
 use crate::{
@@ -569,23 +570,23 @@ pub async fn create_index_cli(args: CreateIndexArgs) -> anyhow::Result<()> {
 
     let quickwit_config = load_quickwit_config(&args.config_uri).await?;
     let file_content = load_file(&args.index_config_uri).await?;
-    let index_config = IndexConfig::load(&args.index_config_uri, file_content.as_slice()).await?;
+    let index_config_format = ConfigFormat::sniff_from_uri(&args.index_config_uri)?;
+    let index_config = quickwit_config::load_index_config_from_user_config(
+        index_config_format,
+        file_content.as_slice(),
+        &quickwit_config.default_index_root_uri,
+    )
+    .with_context(|| format!("Failed to parse index_config `{}`", &args.index_config_uri))?;
     let index_id = index_config.index_id.clone();
     let metastore_uri_resolver = quickwit_metastore_uri_resolver();
     let metastore = metastore_uri_resolver
         .resolve(&quickwit_config.metastore_uri)
         .await?;
 
-    validate_storage_uri(
-        quickwit_storage_uri_resolver(),
-        &quickwit_config,
-        &index_config,
-    )
-    .await?;
-
     // On overwrite and index present and `assume_yes` if false, ask the user to confirm the
     // destructive operation.
     let index_exists = metastore.index_exists(&index_id).await?;
+
     if args.overwrite && index_exists && !args.assume_yes {
         // Stop if user answers no.
         let prompt = format!(
@@ -598,11 +599,7 @@ pub async fn create_index_cli(args: CreateIndexArgs) -> anyhow::Result<()> {
         }
     }
 
-    let index_service = IndexService::new(
-        metastore,
-        quickwit_storage_uri_resolver().clone(),
-        quickwit_config.default_index_root_uri,
-    );
+    let index_service = IndexService::from_config(quickwit_config).await?;
     index_service
         .create_index(index_config, args.overwrite)
         .await?;
@@ -618,14 +615,15 @@ pub async fn list_index_cli(args: ListIndexesArgs) -> anyhow::Result<()> {
         .resolve(&quickwit_config.metastore_uri)
         .await?;
     let indexes = metastore.list_indexes_metadatas().await?;
-    let index_table = make_list_indexes_table(indexes);
+    let index_table =
+        make_list_indexes_table(indexes.into_iter().map(IndexMetadata::into_index_config));
 
     println!("\n{}\n", index_table);
     Ok(())
 }
 
 fn make_list_indexes_table<I>(indexes: I) -> Table
-where I: IntoIterator<Item = IndexMetadata> {
+where I: IntoIterator<Item = IndexConfig> {
     let rows = indexes
         .into_iter()
         .map(|index| IndexRow {
@@ -651,9 +649,9 @@ pub async fn describe_index_cli(args: DescribeIndexArgs) -> anyhow::Result<()> {
     let metastore = metastore_uri_resolver
         .resolve(&quickwit_config.metastore_uri)
         .await?;
-    let splits = metastore
-        .list_splits(&args.index_id, SplitState::Published, None, None)
-        .await?;
+
+    let query = ListSplitsQuery::for_index(&args.index_id).with_split_state(SplitState::Published);
+    let splits = metastore.list_splits(query).await?;
     let index_metadata = metastore.index_metadata(&args.index_id).await?;
     let index_stats = IndexStats::from_metadata(index_metadata, splits)?;
     println!("{}", index_stats.display_as_table());
@@ -736,7 +734,12 @@ impl IndexStats {
             .collect_vec();
         let total_bytes = splits_bytes.iter().sum::<usize>();
 
-        let timestamp_range = if index_metadata.indexing_settings.timestamp_field.is_some() {
+        let timestamp_range = if index_metadata
+            .index_config()
+            .doc_mapping
+            .timestamp_field
+            .is_some()
+        {
             let time_min = splits
                 .iter()
                 .flat_map(|split| split.split_metadata.time_range.clone())
@@ -764,14 +767,15 @@ impl IndexStats {
         } else {
             (None, None)
         };
+        let index_config = index_metadata.into_index_config();
 
         Ok(Self {
-            index_id: index_metadata.index_id,
-            index_uri: index_metadata.index_uri,
+            index_id: index_config.index_id.clone(),
+            index_uri: index_config.index_uri.clone(),
             num_published_splits: splits.len(),
             num_published_docs: total_num_docs,
             size_published_docs: total_bytes,
-            timestamp_field_name: index_metadata.indexing_settings.timestamp_field,
+            timestamp_field_name: index_config.doc_mapping.timestamp_field,
             timestamp_range,
             num_docs_descriptive,
             num_bytes_descriptive,
@@ -897,11 +901,7 @@ pub async fn ingest_docs_cli(args: IngestDocsArgs) -> anyhow::Result<()> {
         .await?;
 
     if args.overwrite {
-        let index_service = IndexService::new(
-            metastore.clone(),
-            quickwit_storage_uri_resolver().clone(),
-            config.default_index_root_uri.clone(),
-        );
+        let index_service = IndexService::from_config(config.clone()).await?;
         index_service.clear_index(&args.index_id).await?;
     }
     let indexer_config = IndexerConfig {
@@ -926,8 +926,13 @@ pub async fn ingest_docs_cli(args: IngestDocsArgs) -> anyhow::Result<()> {
             pipeline_ord: 0,
         })
         .await?;
-    let pipeline_handle = indexing_server_mailbox
-        .ask_for_res(DetachPipeline { pipeline_id })
+    let merge_pipeline_handle = indexing_server_mailbox
+        .ask_for_res(DetachMergePipeline {
+            pipeline_id: MergePipelineId::from(&pipeline_id),
+        })
+        .await?;
+    let indexing_pipeline_handle = indexing_server_mailbox
+        .ask_for_res(DetachIndexingPipeline { pipeline_id })
         .await?;
 
     let is_stdin_atty = atty::is(atty::Stream::Stdin);
@@ -942,7 +947,9 @@ pub async fn ingest_docs_cli(args: IngestDocsArgs) -> anyhow::Result<()> {
         );
     }
     let statistics =
-        start_statistics_reporting_loop(pipeline_handle, args.input_path_opt.is_none()).await?;
+        start_statistics_reporting_loop(indexing_pipeline_handle, args.input_path_opt.is_none())
+            .await?;
+    merge_pipeline_handle.quit().await;
     // Shutdown the indexing server.
     universe
         .send_exit_with_success(&indexing_server_mailbox)
@@ -1030,7 +1037,6 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
         .await?;
     let storage_resolver = quickwit_storage_uri_resolver().clone();
     start_actor_runtimes(&HashSet::from_iter([QuickwitService::Indexer]))?;
-    let node_id = config.node_id.clone();
     let indexing_server = IndexingService::new(
         config.node_id,
         config.data_dir_path,
@@ -1042,23 +1048,47 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
     let universe = Universe::new();
     let (indexing_service_mailbox, indexing_service_handle) =
         universe.spawn_builder().spawn(indexing_server);
-    let pipeline_id = IndexingPipelineId {
-        index_id: args.index_id,
-        source_id: args.source_id,
-        node_id,
-        pipeline_ord: 0,
-    };
-    indexing_service_mailbox
-        .ask_for_res(SpawnMergePipeline {
-            pipeline_id: pipeline_id.clone(),
+    let pipeline_id = indexing_service_mailbox
+        .ask_for_res(SpawnPipeline {
+            index_id: args.index_id,
+            source_config: SourceConfig {
+                source_id: args.source_id,
+                num_pipelines: 1,
+                enabled: true,
+                source_params: SourceParams::Vec(VecSourceParams::default()),
+            },
+            pipeline_ord: 0,
         })
         .await?;
-    let pipeline_handle = indexing_service_mailbox
-        .ask_for_res(DetachPipeline { pipeline_id })
+    let pipeline_handle: ActorHandle<MergePipeline> = indexing_service_mailbox
+        .ask_for_res(DetachMergePipeline {
+            pipeline_id: MergePipelineId::from(&pipeline_id),
+        })
         .await?;
-    let (pipeline_exit_status, _pipeline_statistics) = pipeline_handle.join().await;
+
+    let mut check_interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        check_interval.tick().await;
+
+        let observation = pipeline_handle.observe().await;
+
+        if observation.num_ongoing_merges == 0 {
+            info!("Merge pipeline has no more ongoing merges, Exiting.");
+            break;
+        }
+
+        if observation.obs_type == ObservationType::PostMortem {
+            info!("Merge pipeline has exited, Exiting.");
+            break;
+        }
+    }
+
+    let (pipeline_exit_status, _pipeline_statistics) = pipeline_handle.quit().await;
     indexing_service_handle.quit().await;
-    if !pipeline_exit_status.is_success() {
+    if !matches!(
+        pipeline_exit_status,
+        ActorExitStatus::Success | ActorExitStatus::Quit
+    ) {
         bail!(pipeline_exit_status);
     }
     Ok(())
@@ -1069,14 +1099,7 @@ pub async fn delete_index_cli(args: DeleteIndexArgs) -> anyhow::Result<()> {
     quickwit_telemetry::send_telemetry_event(TelemetryEvent::Delete).await;
 
     let quickwit_config = load_quickwit_config(&args.config_uri).await?;
-    let metastore = quickwit_metastore_uri_resolver()
-        .resolve(&quickwit_config.metastore_uri)
-        .await?;
-    let index_service = IndexService::new(
-        metastore,
-        quickwit_storage_uri_resolver().clone(),
-        quickwit_config.default_index_root_uri,
-    );
+    let index_service = IndexService::from_config(quickwit_config.clone()).await?;
     let affected_files = index_service
         .delete_index(&args.index_id, args.dry_run)
         .await?;
@@ -1108,31 +1131,36 @@ pub async fn garbage_collect_index_cli(args: GarbageCollectIndexArgs) -> anyhow:
     quickwit_telemetry::send_telemetry_event(TelemetryEvent::GarbageCollect).await;
 
     let quickwit_config = load_quickwit_config(&args.config_uri).await?;
-    let metastore = quickwit_metastore_uri_resolver()
-        .resolve(&quickwit_config.metastore_uri)
-        .await?;
-    let index_service = IndexService::new(
-        metastore,
-        quickwit_storage_uri_resolver().clone(),
-        quickwit_config.default_index_root_uri,
-    );
-    let deleted_files = index_service
+    let index_service = IndexService::from_config(quickwit_config.clone()).await?;
+    let removal_info = index_service
         .garbage_collect_index(&args.index_id, args.grace_period, args.dry_run)
         .await?;
-    if deleted_files.is_empty() {
+    if removal_info.removed_split_entries.is_empty() && removal_info.failed_split_ids.is_empty() {
         println!("No dangling files to garbage collect.");
         return Ok(());
     }
 
     if args.dry_run {
         println!("The following files will be garbage collected.");
-        for file_entry in deleted_files {
+        for file_entry in removal_info.removed_split_entries {
             println!(" - {}", file_entry.file_name);
         }
         return Ok(());
     }
 
-    let deleted_bytes: u64 = deleted_files
+    if !removal_info.failed_split_ids.is_empty() {
+        println!("The following splits were attempted to be removed, but failed.");
+        for split_id in removal_info.failed_split_ids.iter() {
+            println!(" - {}", split_id);
+        }
+        println!(
+            "{} Splits were unable to be removed.",
+            removal_info.failed_split_ids.len()
+        );
+    }
+
+    let deleted_bytes: u64 = removal_info
+        .removed_split_entries
         .iter()
         .map(|entry| entry.file_size_in_bytes)
         .sum();
@@ -1140,7 +1168,17 @@ pub async fn garbage_collect_index_cli(args: GarbageCollectIndexArgs) -> anyhow:
         "{}MB of storage garbage collected.",
         deleted_bytes / 1_000_000
     );
-    println!("Index `{}` successfully garbage collected.", args.index_id);
+
+    if removal_info.failed_split_ids.is_empty() {
+        println!("Index `{}` successfully garbage collected.", args.index_id);
+    } else if removal_info.removed_split_entries.is_empty()
+        && !removal_info.failed_split_ids.is_empty()
+    {
+        println!("Failed to garbage collect index `{}`.", args.index_id);
+    } else {
+        println!("Index `{}` partially garbage collected.", args.index_id);
+    }
+
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "quickwit-cli"
-version = "0.3.1"
+version = "0.4.0"
 authors = ["Quickwit, Inc. <hello@quickwit.io>"]
 edition = "2021"
 license = "AGPL-3.0-or-later"                               # For a commercial, license, contact hello@quickwit.io
@@ -68,7 +68,6 @@ quickwit-storage = { workspace = true }
 quickwit-telemetry = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = { workspace = true }
 predicates = { workspace = true }
 reqwest = { workspace = true }
 serial_test = { workspace = true }

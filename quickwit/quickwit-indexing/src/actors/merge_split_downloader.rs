@@ -144,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_split_downloader() -> anyhow::Result<()> {
-        let scratch_directory = ScratchDirectory::for_test()?;
+        let scratch_directory = ScratchDirectory::for_test();
         let splits_to_merge: Vec<SplitMetadata> = iter::repeat_with(|| {
             let split_id = new_split_id();
             SplitMetadata {
@@ -200,7 +200,7 @@ mod tests {
                 .downloaded_splits_directory
                 .path()
                 .join(&split_filename);
-            assert!(split_filepath.exists());
+            assert!(split_filepath.try_exists().unwrap());
         }
         Ok(())
     }

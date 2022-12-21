@@ -165,7 +165,7 @@ impl DocProcessor {
 
     fn prepare_document(
         &self,
-        doc_json: String,
+        doc_json: &str,
         ctx: &ActorContext<Self>,
     ) -> Result<PreparedDoc, PrepareDocumentError> {
         // Parse the document
@@ -193,7 +193,7 @@ impl DocProcessor {
             .get_first(timestamp_field)
             .and_then(|value| match value {
                 Value::Date(date_time) => Some(date_time.into_timestamp_secs()),
-                value => value.as_i64(),
+                _ => None,
             })
             .ok_or(PrepareDocumentError::MissingField)?;
         Ok(PreparedDoc {
@@ -259,7 +259,7 @@ impl Handler<RawDocBatch> for DocProcessor {
         let mut prepared_docs: Vec<PreparedDoc> = Vec::with_capacity(raw_doc_batch.docs.len());
         for doc_json in raw_doc_batch.docs {
             let doc_json_num_bytes = doc_json.len() as u64;
-            match self.prepare_document(doc_json, ctx) {
+            match self.prepare_document(&doc_json, ctx) {
                 Ok(document) => {
                     self.counters.record_valid(doc_json_num_bytes);
                     prepared_docs.push(document);
@@ -306,6 +306,8 @@ mod tests {
     use quickwit_actors::{create_test_mailbox, Universe};
     use quickwit_doc_mapper::{default_doc_mapper_for_test, DefaultDocMapper};
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
+    use serde_json::Value as JsonValue;
+    use tantivy::schema::NamedFieldDocument;
 
     use super::*;
     use crate::models::{PublishLock, RawDocBatch};
@@ -364,23 +366,23 @@ mod tests {
         assert_eq!(batch.checkpoint_delta, checkpoint_delta);
 
         let schema = doc_mapper.schema();
-        let doc_json: serde_json::Value =
-            serde_json::from_str(&schema.to_json(&batch.docs[0].doc)).unwrap();
+        let NamedFieldDocument(named_field_doc_map) = schema.to_named_doc(&batch.docs[0].doc);
+        let doc_json = JsonValue::Object(doc_mapper.doc_to_json(named_field_doc_map)?);
         assert_eq!(
             doc_json,
             serde_json::json!({
-                "_source": [{
+                "_source": {
                     "body": "happy",
                     "response_date": "2021-12-19T16:39:59+00:00",
                     "response_payload": "YWJj",
                     "response_time": 2,
                     "timestamp": 1628837062
-                }],
-                "body": ["happy"],
-                "response_date": ["2021-12-19T16:39:59Z"],
-                 "response_payload": ["YWJj"],
-                 "response_time": [2.0],
-                 "timestamp": [1628837062]
+                },
+                "body": "happy",
+                "response_date": "2021-12-19T16:39:59Z",
+                 "response_payload": "YWJj",
+                 "response_time": 2.0,
+                 "timestamp": 1628837062
             })
         );
         Ok(())

@@ -17,6 +17,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+#![deny(clippy::disallowed_methods)]
+
 mod errors;
 mod ingest_api_service;
 mod metrics;
@@ -29,7 +31,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 pub use errors::IngestApiError;
 use errors::Result;
-pub use ingest_api_service::IngestApiService;
+pub use ingest_api_service::{GetPartitionId, IngestApiService};
 use metrics::INGEST_METRICS;
 use once_cell::sync::OnceCell;
 pub use position::Position;
@@ -57,10 +59,11 @@ pub async fn init_ingest_api(
     if let Some(mailbox) = guard.get(queues_dir_path) {
         return Ok(mailbox.clone());
     }
-    let ingest_api_actor =
-        IngestApiService::with_queues_dir(queues_dir_path).with_context(|| {
+    let ingest_api_actor = IngestApiService::with_queues_dir(queues_dir_path)
+        .await
+        .with_context(|| {
             format!(
-                "Failed to open RocksDB instance located at `{}`.",
+                "Failed to open the ingest API record log located at `{}`.",
                 queues_dir_path.display()
             )
         })?;
