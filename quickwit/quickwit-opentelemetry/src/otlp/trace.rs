@@ -73,15 +73,12 @@ doc_mapping:
       fast: true
       input_formats: [unix_timestamp]
       output_format: unix_timestamp_secs
-    - name: span_start_timestamp_nanos
-      type: i64
-      indexed: false
-    - name: span_end_timestamp_nanos
-      type: i64
-      indexed: false
+    - name: span_end_timestamp_secs
+      type: u64
+      fast: true
     - name: span_duration_secs
-      type: i64
-      indexed: false
+      type: u64
+      fast: true
     - name: span_attributes
       type: json
       tokenizer: raw

@@ -19,7 +19,7 @@
 
 #![deny(clippy::disallowed_methods)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,12 +34,13 @@ use quickwit_proto::jaeger::storage::v1::span_reader_plugin_server::SpanReaderPl
 use quickwit_proto::jaeger::storage::v1::{
     FindTraceIDsRequest, FindTraceIDsResponse, FindTracesRequest, GetOperationsRequest,
     GetOperationsResponse, GetServicesRequest, GetServicesResponse, GetTraceRequest, Operation,
-    SpansResponseChunk,
+    SpansResponseChunk, TraceQueryParameters,
 };
 use quickwit_proto::opentelemetry::proto::trace::v1::Status as OtlpStatus;
 use quickwit_proto::SearchRequest;
-use quickwit_search::SearchService;
+use quickwit_search::{SearchError, SearchService};
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -50,6 +51,9 @@ use tracing::{debug, warn};
 
 const TRACE_INDEX_ID: &str = "otel-trace-v0";
 
+/// A base64-encoded 16-byte array.
+type TraceId = String;
+
 pub struct JaegerService {
     search_service: Arc<dyn SearchService>,
 }
@@ -58,6 +62,56 @@ impl JaegerService {
     pub fn new(search_service: Arc<dyn SearchService>) -> Self {
         Self { search_service }
     }
+}
+
+impl JaegerService {
+    async fn find_trace_ids(
+        &self,
+        trace_query: TraceQueryParameters,
+    ) -> Result<Vec<TraceId>, SearchError> {
+        let start_timestamp = trace_query.start_time_min.map(|ts| ts.seconds);
+        let end_timestamp = trace_query.start_time_max.map(|ts| ts.seconds);
+        let min_duration = trace_query.duration_min.map(|duration| duration.seconds);
+        let max_duration = trace_query.duration_max.map(|duration| duration.seconds);
+        let query = build_search_query(
+            &trace_query.service_name,
+            "",
+            &trace_query.operation_name,
+            trace_query.tags,
+            start_timestamp,
+            end_timestamp,
+            min_duration,
+            max_duration,
+        );
+        let max_hits = 0;
+        let search_request = SearchRequest {
+            index_id: TRACE_INDEX_ID.to_string(),
+            query,
+            max_hits,
+            start_timestamp,
+            end_timestamp,
+            search_fields: Vec::new(),
+            start_offset: 0,
+            sort_order: None,
+            sort_by_field: None,
+            aggregation_request: Some(build_aggs_request(trace_query.num_traces as usize)),
+            snippet_fields: Vec::new(),
+        };
+        let search_response = self.search_service.root_search(search_request).await?;
+        // let trace_ids: Vec<String> = search_response
+        //     .aggregation
+        //     .into_iter()
+        //     .map(|hit| {
+        //         serde_json::from_str::<JsonValue>(&hit.json)
+        //             .expect("Failed to deserialize hit. This should never happen!")
+        //     })
+        //     .flat_map(extract_trace_id)
+        //     .collect();
+        debug!(trace_ids=?trace_ids, "`find_traces` matched trace IDs");
+        Ok(trace_ids)
+    }
+
+    async fn fetch_traces(&self, trace_ids: &[&str]) {}
 }
 
 type SpanStream = ReceiverStream<Result<SpansResponseChunk, Status>>;
@@ -75,13 +129,18 @@ impl SpanReaderPlugin for JaegerService {
         let request = request.into_inner();
         debug!(request=?request, "`get_services` request");
 
+        let index_id = TRACE_INDEX_ID.to_string();
+        let query = "*".to_string();
+        let max_hits = 500;
+        let start_timestamp = Some(OffsetDateTime::now_utc().unix_timestamp() - 24 * 3600); // 24 hours lookback
+
         let search_request = SearchRequest {
-            index_id: TRACE_INDEX_ID.to_string(),
-            query: build_query("", "", "", HashMap::new()),
-            search_fields: Vec::new(),
-            start_timestamp: None, // TODO: limit to last 24h?
+            index_id,
+            query,
+            max_hits,
+            start_timestamp,
             end_timestamp: None,
-            max_hits: 1_000,
+            search_fields: Vec::new(),
             start_offset: 0,
             sort_order: None,
             sort_by_field: None,
@@ -112,13 +171,27 @@ impl SpanReaderPlugin for JaegerService {
         let request = request.into_inner();
         debug!(request=?request, "`get_operations` request");
 
+        let index_id = TRACE_INDEX_ID.to_string();
+        let query = build_search_query(
+            &request.service,
+            &request.span_kind,
+            "",
+            HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let max_hits = 500;
+        let start_timestamp = Some(OffsetDateTime::now_utc().unix_timestamp() - 24 * 3600); // 24 hours lookback
+
         let search_request = SearchRequest {
-            index_id: TRACE_INDEX_ID.to_string(),
-            query: build_query(&request.service, &request.span_kind, "", HashMap::new()),
-            search_fields: Vec::new(),
-            start_timestamp: None, // TODO: limit to last 24h?
+            index_id,
+            query,
+            max_hits,
+            start_timestamp,
             end_timestamp: None,
-            max_hits: 1_000,
+            search_fields: Vec::new(),
             start_offset: 0,
             sort_order: None,
             sort_by_field: None,
@@ -145,6 +218,21 @@ impl SpanReaderPlugin for JaegerService {
         Ok(Response::new(response))
     }
 
+    async fn find_trace_i_ds(
+        &self,
+        request: Request<FindTraceIDsRequest>,
+    ) -> Result<Response<FindTraceIDsResponse>, Status> {
+        let request = request.into_inner();
+        debug!(request=?request, "`find_trace_ids` request");
+        let trace_query = request
+            .query
+            .ok_or_else(|| Status::invalid_argument("Query is empty."))?;
+        let trace_ids = self.find_trace_ids(trace_query).await?;
+        let response = FindTraceIDsResponse { trace_ids };
+        debug!(response=?response, "`find_trace_ids` response");
+        Ok(Response::new(response))
+    }
+
     async fn find_traces(
         &self,
         request: Request<FindTracesRequest>,
@@ -152,37 +240,10 @@ impl SpanReaderPlugin for JaegerService {
         let request = request.into_inner();
         debug!(request=?request, "`find_traces` request");
 
-        let query = request
+        let trace_query = request
             .query
             .ok_or_else(|| Status::invalid_argument("Trace query is empty."))?;
-        let start_timestamp = query.start_time_min.map(|ts| ts.seconds);
-        let end_timestamp = query.start_time_max.map(|ts| ts.seconds);
-        // TODO: Push span duration filter.
-        let max_hits = query.num_traces as u64;
-        let search_request = SearchRequest {
-            index_id: TRACE_INDEX_ID.to_string(),
-            query: build_query(&query.service_name, "", &query.operation_name, query.tags),
-            search_fields: Vec::new(),
-            start_timestamp,
-            end_timestamp,
-            max_hits,
-            start_offset: 0,
-            sort_order: None,
-            sort_by_field: None,
-            aggregation_request: None,
-            snippet_fields: Vec::new(),
-        };
-        let search_response = self.search_service.root_search(search_request).await?;
-        let trace_ids: HashSet<String> = search_response
-            .hits
-            .into_iter()
-            .map(|hit| {
-                serde_json::from_str::<JsonValue>(&hit.json)
-                    .expect("Failed to deserialize hit. This should never happen!")
-            })
-            .flat_map(extract_trace_id)
-            .collect();
-        debug!(trace_ids=?trace_ids, "`find_traces` matched trace IDs");
+        let trace_ids = self.find_trace_ids(trace_query).await?;
         if trace_ids.is_empty() {
             let (_tx, rx) = mpsc::channel(1);
             return Ok(Response::new(ReceiverStream::new(rx)));
@@ -220,53 +281,6 @@ impl SpanReaderPlugin for JaegerService {
             .await
             .expect("The channel should be opened and empty.");
         let response = ReceiverStream::new(rx);
-        Ok(Response::new(response))
-    }
-
-    async fn find_trace_i_ds(
-        &self,
-        request: Request<FindTraceIDsRequest>,
-    ) -> Result<Response<FindTraceIDsResponse>, Status> {
-        let request = request.into_inner();
-        debug!(request=?request, "`find_trace_ids` request");
-        let query = request
-            .query
-            .ok_or_else(|| Status::invalid_argument("Query is empty."))?;
-        let start_timestamp = query.start_time_min.map(|ts| ts.seconds);
-        let end_timestamp = query.start_time_max.map(|ts| ts.seconds);
-        // TODO: Push span duration filter.
-        let max_hits = query.num_traces as u64;
-        let search_request = SearchRequest {
-            index_id: TRACE_INDEX_ID.to_string(),
-            query: build_query(&query.service_name, "", &query.operation_name, query.tags),
-            search_fields: Vec::new(),
-            start_timestamp,
-            end_timestamp,
-            max_hits,
-            start_offset: 0,
-            sort_order: None,
-            sort_by_field: None,
-            aggregation_request: None,
-            snippet_fields: Vec::new(),
-        };
-        let search_response = self.search_service.root_search(search_request).await?;
-        let trace_ids: Vec<Vec<u8>> = search_response
-            .hits
-            .into_iter()
-            .map(|hit| {
-                serde_json::from_str::<JsonValue>(&hit.json)
-                    .expect("Failed to deserialize hit. This should never happen.")
-            })
-            .filter_map(extract_trace_id)
-            .sorted()
-            .dedup()
-            .map(|trace_id| {
-                base64::decode(trace_id)
-                    .expect("Failed to decode trace ID. This should never happen!")
-            })
-            .collect();
-        let response = FindTraceIDsResponse { trace_ids };
-        debug!(response=?response, "`find_trace_ids` response");
         Ok(Response::new(response))
     }
 
@@ -336,11 +350,15 @@ fn extract_trace_id(mut doc: JsonValue) -> Option<String> {
     }
 }
 
-fn build_query(
+fn build_search_query(
     service_name: &str,
     span_kind: &str,
     span_name: &str,
     mut tags: HashMap<String, String>,
+    start_timestamp: Option<i64>,
+    end_timestamp: Option<i64>,
+    min_duration: Option<i64>,
+    max_duration: Option<i64>,
 ) -> String {
     if let Some(qw_query) = tags.remove("_qw_query") {
         return qw_query;
@@ -399,6 +417,28 @@ fn build_query(
     }
     debug!(query=%query, "Search query");
     query
+}
+
+fn build_aggs_request(num_traces: usize) -> String {
+    format!(
+        r#"{{
+            "trace_ids": {{
+                "terms": {{
+                    "field": "trace_id",
+                    "size": {num_traces},
+                    "order": {{
+                        "span_start_timestamp_stats.max": "desc"
+                    }}
+                }},
+                "aggs": {{
+                    "span_start_timestamp_stats": {{
+                        "stats": {{
+                            "field": "span_start_timestamp_secs"
+                        }}
+                    }}
+                }}
+            }}"#
+    )
 }
 
 fn qw_span_to_jaeger_span(qw_span: &str) -> Result<JaegerSpan, Status> {
@@ -719,7 +759,10 @@ mod tests {
             let span_kind = "";
             let span_name = "";
             let tags = HashMap::new();
-            assert_eq!(build_query(service_name, span_kind, span_name, tags), "*");
+            assert_eq!(
+                build_search_query(service_name, span_kind, span_name, tags),
+                "*"
+            );
         }
         {
             let service_name = "quickwit";
@@ -727,7 +770,7 @@ mod tests {
             let span_name = "";
             let tags = HashMap::new();
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 "service_name:quickwit"
             );
         }
@@ -737,7 +780,7 @@ mod tests {
             let span_name = "";
             let tags = HashMap::from_iter([("_qw_query".to_string(), "query".to_string())]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 "query"
             );
         }
@@ -747,7 +790,7 @@ mod tests {
             let span_name = "";
             let tags = HashMap::new();
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 "span_kind:3"
             );
         }
@@ -757,7 +800,7 @@ mod tests {
             let span_name = "leaf_search";
             let tags = HashMap::new();
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 "span_name:leaf_search"
             );
         }
@@ -767,7 +810,7 @@ mod tests {
             let span_name = "";
             let tags = HashMap::from_iter([("foo".to_string(), "bar baz".to_string())]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 r#"(span_attributes.foo:"bar baz" OR events.event_attributes.foo:"bar baz")"#
             );
         }
@@ -777,7 +820,7 @@ mod tests {
             let span_name = "";
             let tags = HashMap::from_iter([("event".to_string(), "Failed to ...".to_string())]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 r#"events.event_name:"Failed to ...""#
             );
         }
@@ -790,7 +833,7 @@ mod tests {
                 ("foo".to_string(), "bar".to_string()),
             ]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 r#"events.event_name:"Failed to ..." AND (span_attributes.foo:"bar" OR events.event_attributes.foo:"bar")"#
             );
         }
@@ -803,7 +846,7 @@ mod tests {
                 ("foo".to_string(), "bar".to_string()),
             ]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 r#"(span_attributes.baz:"qux" OR events.event_attributes.baz:"qux") AND (span_attributes.foo:"bar" OR events.event_attributes.foo:"bar")"#
             );
         }
@@ -813,7 +856,7 @@ mod tests {
             let span_name = "";
             let tags = HashMap::from_iter([("foo".to_string(), "bar".to_string())]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 r#"service_name:quickwit AND (span_attributes.foo:"bar" OR events.event_attributes.foo:"bar")"#
             );
         }
@@ -823,7 +866,7 @@ mod tests {
             let span_name = "";
             let tags = HashMap::from_iter([("foo".to_string(), "bar".to_string())]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 r#"service_name:quickwit AND span_kind:3 AND (span_attributes.foo:"bar" OR events.event_attributes.foo:"bar")"#
             );
         }
@@ -833,7 +876,7 @@ mod tests {
             let span_name = "leaf_search";
             let tags = HashMap::from_iter([("foo".to_string(), "bar".to_string())]);
             assert_eq!(
-                build_query(service_name, span_kind, span_name, tags),
+                build_search_query(service_name, span_kind, span_name, tags),
                 r#"service_name:quickwit AND span_kind:3 AND span_name:leaf_search AND (span_attributes.foo:"bar" OR events.event_attributes.foo:"bar")"#
             );
         }
