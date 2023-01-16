@@ -21,6 +21,7 @@ use std::collections::hash_map::Entry;
 use std::num::NonZeroU32;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -40,6 +41,7 @@ use tantivy::schema::Schema;
 use tantivy::store::{Compressor, ZstdCompressor};
 use tantivy::{IndexBuilder, IndexSettings};
 use tokio::runtime::Handle;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{info, info_span, warn, Span};
 use ulid::Ulid;
 
@@ -48,6 +50,9 @@ use crate::models::{
     CommitTrigger, IndexedSplitBatchBuilder, IndexedSplitBuilder, IndexingPipelineId,
     NewPublishLock, PreparedDoc, PreparedDocBatch, PublishLock, ScratchDirectory,
 };
+
+/// Limits the number of concurrent active workbenches to 10.
+static INDEXING_PERMITS: Semaphore = Semaphore::const_new(10);
 
 // Random partition id used to gather partitions exceeding the maximum number of partitions.
 const OTHER_PARTITION_ID: u64 = 3264326757911759461u64;
@@ -107,8 +112,8 @@ impl IndexerState {
             io_controls,
         )?;
         info!(
-            split_id = indexed_split.split_id(),
-            partition_id = partition_id,
+            split_id=%indexed_split.split_id(),
+            partition_id=%partition_id,
             "new-split"
         );
         Ok(indexed_split)
@@ -153,27 +158,38 @@ impl IndexerState {
         }
     }
 
-    async fn create_workbench(&self) -> anyhow::Result<IndexingWorkbench> {
+    async fn create_workbench(
+        &self,
+        ctx: &ActorContext<Indexer>,
+    ) -> anyhow::Result<IndexingWorkbench> {
+        let workbench_id = Ulid::new();
+        let batch_parent_span = info_span!(target: "quickwit-indexing", "index-doc-batches",
+            index_id=%self.pipeline_id.index_id,
+            source_id=%self.pipeline_id.source_id,
+            pipeline_ord=%self.pipeline_id.pipeline_ord,
+            workbench_id=%workbench_id,
+        );
+        let indexing_span = info_span!(parent: batch_parent_span.id(), "indexer");
+        let indexing_permit: SemaphorePermit<'static> = ctx
+            .protect_future(INDEXING_PERMITS.acquire())
+            .await
+            .unwrap();
         let last_delete_opstamp = self
             .metastore
             .last_delete_opstamp(&self.pipeline_id.index_id)
             .await?;
-        let batch_parent_span = info_span!(target: "quickwit-indexing", "index_batch",
-            index_id=%self.pipeline_id.index_id,
-            source_id=%self.pipeline_id.source_id,
-            pipeline_ord=%self.pipeline_id.pipeline_ord
-        );
-        let indexing_span = info_span!(parent: batch_parent_span.id(), "indexer");
         let workbench = IndexingWorkbench {
+            workbench_id,
+            create_instant: Instant::now(),
             batch_parent_span,
             _indexing_span: indexing_span,
-            workbench_id: Ulid::new(),
             indexed_splits: FnvHashMap::with_capacity_and_hasher(250, Default::default()),
             other_indexed_split_opt: None,
             checkpoint_delta: IndexCheckpointDelta {
                 source_id: self.pipeline_id.source_id.clone(),
                 source_delta: SourceCheckpointDelta::default(),
             },
+            indexing_permit,
             publish_lock: self.publish_lock.clone(),
             last_delete_opstamp,
             memory_usage: Byte::from_bytes(0),
@@ -191,7 +207,7 @@ impl IndexerState {
         ctx: &'a ActorContext<Indexer>,
     ) -> anyhow::Result<&'a mut IndexingWorkbench> {
         if indexing_workbench_opt.is_none() {
-            let indexing_workbench = self.create_workbench().await?;
+            let indexing_workbench = self.create_workbench(ctx).await?;
             let commit_timeout_message = CommitTimeout {
                 workbench_id: indexing_workbench.workbench_id,
             };
@@ -227,6 +243,8 @@ impl IndexerState {
             .get_or_create_workbench(indexing_workbench_opt, ctx)
             .await?;
         if publish_lock.is_dead() {
+            // Release indexing permit early.
+            indexing_workbench_opt.take();
             return Ok(());
         }
         checkpoint_delta
@@ -273,6 +291,7 @@ impl IndexerState {
 /// A workbench hosts the set of `IndexedSplit` that are being built.
 struct IndexingWorkbench {
     workbench_id: Ulid,
+    create_instant: Instant,
     // This span is used for the entire lifetime of the splits batch creations
     // This span is meant to be passed through the pipeline.
     batch_parent_span: Span,
@@ -283,6 +302,7 @@ struct IndexingWorkbench {
     other_indexed_split_opt: Option<IndexedSplitBuilder>,
 
     checkpoint_delta: IndexCheckpointDelta,
+    indexing_permit: SemaphorePermit<'static>,
     publish_lock: PublishLock,
     // On workbench creation, we fetch from the metastore the last delete task opstamp.
     // We use this value to set the `delete_opstamp` of the workbench splits.
@@ -322,6 +342,27 @@ impl Actor for Indexer {
     #[inline]
     fn yield_after_each_message(&self) -> bool {
         false
+    }
+
+    async fn on_drained_messages(
+        &mut self,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        let create_instant = if let Some(indexing_workbench) = &self.indexing_workbench_opt {
+            indexing_workbench.create_instant
+        } else {
+            return Ok(());
+        };
+        self.send_to_serializer(CommitTrigger::Drained, ctx).await?;
+        let elapsed = create_instant.elapsed();
+        let commit_timeout = self.indexer_state.indexing_settings.commit_timeout();
+        if elapsed >= commit_timeout {
+            return Ok(());
+        }
+        // Time to take a nap.
+        let sleep_for = commit_timeout - elapsed;
+        ctx.sleep(sleep_for).await;
+        Ok(())
     }
 
     async fn finalize(
@@ -419,16 +460,15 @@ impl Indexer {
             docstore_blocksize: indexing_settings.docstore_blocksize,
             docstore_compression,
             docstore_compress_dedicated_thread: true,
-            sort_by_field: None,
+            ..Default::default()
         };
-        let publish_lock = PublishLock::default();
         Self {
             indexer_state: IndexerState {
                 pipeline_id,
                 metastore: metastore.clone(),
                 indexing_directory,
                 indexing_settings,
-                publish_lock,
+                publish_lock: PublishLock::default(),
                 schema,
                 index_settings,
                 max_num_partitions: doc_mapper.max_num_partitions(),
@@ -482,20 +522,22 @@ impl Indexer {
         commit_trigger: CommitTrigger,
         ctx: &ActorContext<Self>,
     ) -> anyhow::Result<()> {
-        let IndexingWorkbench {
+        let Some(IndexingWorkbench {
             indexed_splits,
             other_indexed_split_opt,
             checkpoint_delta,
             publish_lock,
             batch_parent_span,
+            indexing_permit,
             ..
-        } = if let Some(indexing_workbench) = self.indexing_workbench_opt.take() {
-            indexing_workbench
-        } else {
+        }) = self.indexing_workbench_opt.take() else {
             return Ok(());
         };
+        // Dropping the indexing permit explicitly here for enhanced readability.
+        drop(indexing_permit);
 
         let mut splits: Vec<IndexedSplitBuilder> = indexed_splits.into_values().collect();
+
         if let Some(other_split) = other_indexed_split_opt {
             splits.push(other_split)
         }
