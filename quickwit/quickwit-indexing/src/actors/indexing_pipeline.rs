@@ -47,6 +47,8 @@ use crate::source::{quickwit_supported_sources, SourceActor, SourceExecutionCont
 use crate::split_store::IndexingSplitStore;
 use crate::SplitsUpdateMailbox;
 
+const OBSERVE_INTERVAL: Duration = Duration::from_secs(10);
+
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(600); // 10 min.
 
 /// Calculates the wait time based on retry count.
@@ -436,7 +438,7 @@ impl Handler<Observe> for IndexingPipeline {
                 .set_generation(self.statistics.generation)
                 .set_num_spawn_attempts(self.statistics.num_spawn_attempts);
         }
-        ctx.schedule_self_msg(Duration::from_secs(1), Observe).await;
+        ctx.schedule_self_msg(OBSERVE_INTERVAL, Observe).await;
         Ok(())
     }
 }
