@@ -92,9 +92,7 @@ pub(crate) fn build_query(
 fn resolve_fields(schema: &Schema, field_names: &[String]) -> anyhow::Result<Vec<Field>> {
     let mut fields = vec![];
     for field_name in field_names {
-        let field = schema
-            .get_field(field_name)
-            .ok_or_else(|| TantivyQueryParserError::FieldDoesNotExist(field_name.clone()))?;
+        let field = schema.get_field(field_name)?;
         fields.push(field);
     }
     Ok(fields)
@@ -231,8 +229,7 @@ fn validate_requested_snippet_fields(
 
         let field_entry = schema
             .get_field(field_name)
-            .map(|field| schema.get_field_entry(field))
-            .ok_or_else(|| anyhow::anyhow!("The snippet field `{}` does not exist.", field_name))?;
+            .map(|field| schema.get_field_entry(field))?;
         match field_entry.field_type() {
             FieldType::Str(text_options) => {
                 if !text_options.is_stored() {
@@ -459,7 +456,7 @@ mod test {
             "title:foo desc:bar",
             vec!["url".to_string()],
             None,
-            TestExpectation::Err("Field does not exist: 'url'"),
+            TestExpectation::Err("field does not exist: 'url'"),
         )
         .unwrap();
         check_build_query(
@@ -526,14 +523,14 @@ mod test {
             "dt:[2023-01-10T15:13:35Z TO 2023-01-10T15:13:40Z]",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(10), value_type: Date"),
+            TestExpectation::Ok("RangeQuery { field: \"dt\", value_type: Date"),
         )
         .unwrap();
         check_build_query(
             "dt:<2023-01-10T15:13:35Z",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(10), value_type: Date"),
+            TestExpectation::Ok("RangeQuery { field: \"dt\", value_type: Date"),
         )
         .unwrap();
     }
@@ -545,7 +542,7 @@ mod test {
             Vec::new(),
             None,
             TestExpectation::Ok(
-                "RangeQuery { field: Field(7), value_type: IpAddr, left_bound: Included([0, 0, 0, \
+                "RangeQuery { field: \"ip\", value_type: IpAddr, left_bound: Included([0, 0, 0, \
                  0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1]), right_bound: Included([0, 0, 0, \
                  0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 1, 1, 1]) }",
             ),
@@ -556,7 +553,7 @@ mod test {
             Vec::new(),
             None,
             TestExpectation::Ok(
-                "RangeQuery { field: Field(7), value_type: IpAddr, left_bound: Excluded([0, 0, 0, \
+                "RangeQuery { field: \"ip\", value_type: IpAddr, left_bound: Excluded([0, 0, 0, \
                  0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1]), right_bound: Unbounded }",
             ),
         )
@@ -569,14 +566,14 @@ mod test {
             "f64_fast:[7.7 TO 77.7]",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(13), value_type: F64"),
+            TestExpectation::Ok("RangeQuery { field: \"f64_fast\", value_type: F64"),
         )
         .unwrap();
         check_build_query(
             "f64_fast:>7",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(13), value_type: F64"),
+            TestExpectation::Ok("RangeQuery { field: \"f64_fast\", value_type: F64"),
         )
         .unwrap();
     }
@@ -587,14 +584,14 @@ mod test {
             "i64_fast:[-7 TO 77]",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(12), value_type: I64"),
+            TestExpectation::Ok("RangeQuery { field: \"i64_fast\", value_type: I64"),
         )
         .unwrap();
         check_build_query(
             "i64_fast:>7",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(12), value_type: I64"),
+            TestExpectation::Ok("RangeQuery { field: \"i64_fast\", value_type: I64"),
         )
         .unwrap();
     }
@@ -605,14 +602,14 @@ mod test {
             "u64_fast:[7 TO 77]",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(11), value_type: U64"),
+            TestExpectation::Ok("RangeQuery { field: \"u64_fast\", value_type: U64"),
         )
         .unwrap();
         check_build_query(
             "u64_fast:>7",
             Vec::new(),
             None,
-            TestExpectation::Ok("RangeQuery { field: Field(11), value_type: U64"),
+            TestExpectation::Ok("RangeQuery { field: \"u64_fast\", value_type: U64"),
         )
         .unwrap();
     }
@@ -624,7 +621,7 @@ mod test {
             Vec::new(),
             None,
             TestExpectation::Ok(
-                "RangeQuery { field: Field(8), value_type: IpAddr, left_bound: Included([0, 0, 0, \
+                "RangeQuery { field: \"ips\", value_type: IpAddr, left_bound: Included([0, 0, 0, \
                  0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1]), right_bound: Included([0, 0, 0, \
                  0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 1, 1, 1]) }",
             ),
@@ -721,7 +718,7 @@ mod test {
         );
         assert_eq!(
             validation_result.unwrap_err().to_string(),
-            "The snippet field `summary` does not exist."
+            "The field does not exist: 'summary'"
         );
         // Unknown searched field
         let validation_result =
