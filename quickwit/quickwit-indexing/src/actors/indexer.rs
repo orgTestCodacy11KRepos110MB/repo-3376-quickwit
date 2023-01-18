@@ -333,7 +333,7 @@ impl Actor for Indexer {
     }
 
     fn queue_capacity(&self) -> QueueCapacity {
-        QueueCapacity::Bounded(10)
+        QueueCapacity::Bounded(100)
     }
 
     fn name(&self) -> String {
@@ -364,7 +364,8 @@ impl Actor for Indexer {
         if elapsed < commit_timeout {
             // Time to take a nap.
             let sleep_for = commit_timeout - elapsed;
-            ctx.sleep(sleep_for).await;
+            info!("Source drained, sleeping for {} ms.", sleep_for.as_millis());
+            ctx.protect_future(ctx.sleep(sleep_for)).await;
         }
         Ok(())
     }
