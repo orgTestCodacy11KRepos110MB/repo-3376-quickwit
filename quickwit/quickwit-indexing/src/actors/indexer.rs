@@ -163,17 +163,22 @@ impl IndexerState {
         ctx: &ActorContext<Indexer>,
     ) -> anyhow::Result<IndexingWorkbench> {
         let workbench_id = Ulid::new();
-        let batch_parent_span = info_span!(target: "quickwit-indexing", "index-doc-batches",
+        let batch_parent_span = info_span!(target: "quickwit-indexing", "index-split-batch",
             index_id=%self.pipeline_id.index_id,
             source_id=%self.pipeline_id.source_id,
             pipeline_ord=%self.pipeline_id.pipeline_ord,
             workbench_id=%workbench_id,
         );
         let indexing_span = info_span!(parent: batch_parent_span.id(), "indexer");
+        let acquire_indexing_permit_span =
+            info_span!(parent: indexing_span.id(), "acquire-indexing-permit");
+        let indexing_permit_span_guard = acquire_indexing_permit_span.enter();
         let indexing_permit: SemaphorePermit<'static> = ctx
             .protect_future(INDEXING_PERMITS.acquire())
             .await
             .unwrap();
+        drop(indexing_permit_span_guard);
+
         let last_delete_opstamp = self
             .metastore
             .last_delete_opstamp(&self.pipeline_id.index_id)
@@ -356,12 +361,11 @@ impl Actor for Indexer {
         self.send_to_serializer(CommitTrigger::Drained, ctx).await?;
         let elapsed = create_instant.elapsed();
         let commit_timeout = self.indexer_state.indexing_settings.commit_timeout();
-        if elapsed >= commit_timeout {
-            return Ok(());
+        if elapsed < commit_timeout {
+            // Time to take a nap.
+            let sleep_for = commit_timeout - elapsed;
+            ctx.sleep(sleep_for).await;
         }
-        // Time to take a nap.
-        let sleep_for = commit_timeout - elapsed;
-        ctx.sleep(sleep_for).await;
         Ok(())
     }
 
