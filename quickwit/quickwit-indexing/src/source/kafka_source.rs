@@ -210,6 +210,8 @@ pub struct KafkaSourceState {
     pub num_invalid_messages: u64,
     /// Number of rebalances the consumer went through.
     pub num_rebalances: usize,
+    pub num_batches: usize,
+    pub start: Option<Instant>,
 }
 
 /// A `KafkaSource` consumes a topic and forwards its messages to an `Indexer`.
@@ -244,7 +246,7 @@ impl KafkaSource {
         let topic = params.topic.clone();
         let backfill_mode_enabled = params.enable_backfill_mode;
 
-        let (events_tx, events_rx) = mpsc::channel(100);
+        let (events_tx, events_rx) = mpsc::channel(100_000);
         let (client_config, consumer) = create_consumer(
             &ctx.index_id,
             &ctx.source_config.source_id,
@@ -485,9 +487,13 @@ impl Source for KafkaSource {
         doc_processor_mailbox: &Mailbox<DocProcessor>,
         ctx: &SourceContext,
     ) -> Result<Duration, ActorExitStatus> {
+        if self.state.start.is_none() {
+            self.state.start = Some(Instant::now());
+        }
         let now = Instant::now();
         let mut batch = BatchBuilder::default();
         let deadline = time::sleep(quickwit_actors::HEARTBEAT / 2);
+        self.state.num_batches += 1;
         tokio::pin!(deadline);
 
         loop {
@@ -518,6 +524,17 @@ impl Source for KafkaSource {
                 num_millis=%now.elapsed().as_millis(),
                 "Sending doc batch to indexer.");
             let message = batch.build();
+            if self.state.num_batches % 10 == 0 {
+                let throughput = (self.state.num_bytes_processed as f64
+                    / 1_000_000f64
+                    / self.state.start.unwrap().elapsed().as_secs_f64())
+                    as u64;
+                let avg_batch_size = (self.state.num_bytes_processed as f64
+                    / self.state.num_batches as f64
+                    / 1_000f64)
+                    as u64;
+                info!("Kafka source throughput: {} MB/s. Average batch size: {} KB", throughput, avg_batch_size);
+            }
             ctx.send_message(doc_processor_mailbox, message).await?;
         }
         if self.should_exit() {
@@ -591,10 +608,17 @@ fn spawn_consumer_poll_loop(
             let _ = events_tx.send(KafkaEvent::Error(anyhow!(error)));
             return;
         }
+        let mut num_messages = 0usize;
+        let mut num_bytes = 0usize;
+        let start = Instant::now();
         while !events_tx.is_closed() {
             if let Some(message_res) = consumer.poll(Some(Duration::from_secs(1))) {
                 let event = match message_res {
-                    Ok(message) => KafkaEvent::Message(message.into()),
+                    Ok(message) => {
+                        num_messages += 1;
+                        num_bytes += message.payload_len();
+                        KafkaEvent::Message(message.into())
+                    }
                     Err(KafkaError::PartitionEOF(partition)) => KafkaEvent::PartitionEOF(partition),
                     Err(error) => KafkaEvent::Error(anyhow!(error)),
                 };
@@ -606,6 +630,13 @@ fn spawn_consumer_poll_loop(
                 // minutes.
                 if events_tx.blocking_send(event).is_err() {
                     break;
+                }
+
+                if num_messages % 100_000 == 0 {
+                    let elapsed = start.elapsed();
+                    let throughput =
+                        (num_bytes as f64 / 1_000_000f64 / elapsed.as_secs_f64()) as usize;
+                    info!("Kafka consumer throughput: {} MB/s", throughput);
                 }
             }
         }

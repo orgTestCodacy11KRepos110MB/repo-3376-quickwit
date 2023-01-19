@@ -18,6 +18,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
@@ -26,7 +27,7 @@ use quickwit_doc_mapper::{DocMapper, DocParsingError};
 use serde::Serialize;
 use tantivy::schema::{Field, Value};
 use tokio::runtime::Handle;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::actors::Indexer;
 use crate::models::{NewPublishLock, PreparedDoc, PreparedDocBatch, PublishLock, RawDocBatch};
@@ -55,6 +56,9 @@ pub struct DocProcessorCounters {
     ///
     /// Includes both valid and invalid documents.
     pub overall_num_bytes: u64,
+    pub num_batches: u64,
+    #[serde(skip)]
+    pub start: Option<Instant>,
 }
 
 impl DocProcessorCounters {
@@ -66,6 +70,8 @@ impl DocProcessorCounters {
             num_docs_with_missing_fields: 0,
             num_valid_docs: 0,
             overall_num_bytes: 0,
+            num_batches: 0,
+            start: None,
         }
     }
 
@@ -214,7 +220,7 @@ impl Actor for DocProcessor {
     }
 
     fn queue_capacity(&self) -> QueueCapacity {
-        QueueCapacity::Bounded(100)
+        QueueCapacity::Bounded(1000)
     }
 
     fn runtime_handle(&self) -> Handle {
@@ -253,9 +259,13 @@ impl Handler<RawDocBatch> for DocProcessor {
         raw_doc_batch: RawDocBatch,
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
+        if self.counters.start.is_none() {
+            self.counters.start = Some(Instant::now());
+        }
         if self.publish_lock.is_dead() {
             return Ok(());
         }
+        self.counters.num_batches += 1;
         let mut prepared_docs: Vec<PreparedDoc> = Vec::with_capacity(raw_doc_batch.docs.len());
         for doc_json in raw_doc_batch.docs {
             let doc_json_num_bytes = doc_json.len() as u64;
@@ -277,6 +287,13 @@ impl Handler<RawDocBatch> for DocProcessor {
             docs: prepared_docs,
             checkpoint_delta: raw_doc_batch.checkpoint_delta,
         };
+        if self.counters.num_batches % 10 == 0 {
+            let throughput = (self.counters.overall_num_bytes as f64
+                / 1_000_000f64
+                / self.counters.start.unwrap().elapsed().as_secs_f64())
+                as usize;
+            info!("Doc processor throughput: {} MB/s", throughput);
+        }
         ctx.send_message(&self.indexer_mailbox, prepared_doc_batch)
             .await?;
         Ok(())

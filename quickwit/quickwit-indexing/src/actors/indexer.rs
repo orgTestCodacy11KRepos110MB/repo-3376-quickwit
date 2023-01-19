@@ -73,6 +73,8 @@ pub struct IndexerCounters {
     /// Number of (valid) documents in the current workbench.
     /// This value is used to trigger commit and for observation.
     pub num_docs_in_workbench: u64,
+    num_docs: usize,
+    num_bytes: usize,
 }
 
 struct IndexerState {
@@ -84,6 +86,7 @@ struct IndexerState {
     schema: Schema,
     max_num_partitions: NonZeroU32,
     index_settings: IndexSettings,
+    start: Option<Instant>,
 }
 
 impl IndexerState {
@@ -264,6 +267,8 @@ impl IndexerState {
                 partition,
                 num_bytes,
             } = doc;
+            counters.num_docs += 1;
+            counters.num_bytes += num_bytes;
             counters.num_docs_in_workbench += 1;
             let indexed_split: &mut IndexedSplitBuilder = self.get_or_create_indexed_split(
                 partition,
@@ -333,7 +338,7 @@ impl Actor for Indexer {
     }
 
     fn queue_capacity(&self) -> QueueCapacity {
-        QueueCapacity::Bounded(100)
+        QueueCapacity::Bounded(10)
     }
 
     fn name(&self) -> String {
@@ -428,6 +433,9 @@ impl Handler<PreparedDocBatch> for Indexer {
         doc_batch: PreparedDocBatch,
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
+        if self.indexer_state.start.is_none() {
+            self.indexer_state.start = Some(Instant::now());
+        }
         self.index_batch(doc_batch, ctx).await
     }
 }
@@ -477,6 +485,7 @@ impl Indexer {
                 schema,
                 index_settings,
                 max_num_partitions: doc_mapper.max_num_partitions(),
+                start: None,
             },
             index_serializer_mailbox,
             indexing_workbench_opt: None,
@@ -578,6 +587,11 @@ impl Indexer {
         let num_splits = splits.len() as u64;
         let split_ids = splits.iter().map(|split| split.split_id()).join(",");
         info!(commit_trigger=?commit_trigger, split_ids=%split_ids, num_docs=self.counters.num_docs_in_workbench, "send-to-index-serializer");
+        let throughput = (self.counters.num_bytes as f64
+            / 1_000_000f64
+            / self.indexer_state.start.unwrap().elapsed().as_secs_f64())
+            as usize;
+        info!("Indexer throughput: {} MB/s", throughput);
         ctx.send_message(
             &self.index_serializer_mailbox,
             IndexedSplitBatchBuilder {
