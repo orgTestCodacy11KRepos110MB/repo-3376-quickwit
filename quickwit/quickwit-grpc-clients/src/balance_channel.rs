@@ -18,16 +18,19 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::ops::Sub;
+use std::pin::Pin;
+use std::task::{Poll, Context};
 use std::time::Duration;
 
 use quickwit_cluster::ClusterMember;
 use quickwit_config::service::QuickwitService;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
-use tokio::sync::watch::Receiver;
-use tokio_stream::wrappers::WatchStream;
+use tokio::sync::mpsc::Receiver;
+use tokio_stream::{wrappers::WatchStream, Stream};
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::discover::Change;
@@ -51,7 +54,7 @@ const CLIENT_TIMEOUT_DURATION: Duration = if cfg!(any(test, feature = "testsuite
 pub async fn create_balance_channel_from_watched_members(
     mut members_watch_channel: WatchStream<Vec<ClusterMember>>,
     service: QuickwitService,
-) -> anyhow::Result<(Timeout<Channel>, Receiver<usize>)> {
+) -> anyhow::Result<(Timeout<Channel>, tokio::sync::watch::Receiver<usize>)> {
     // Create a balance channel whose endpoint can be updated thanks to a sender.
     let (channel, channel_tx) = Channel::balance_channel(10);
 
