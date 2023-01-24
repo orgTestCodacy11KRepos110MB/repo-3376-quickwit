@@ -21,9 +21,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use hyper::header::CONTENT_TYPE;
+use quickwit_common::simple_list::{from_simple_list, to_simple_list};
+use quickwit_common::FileEntry;
 use quickwit_config::{ConfigFormat, QuickwitConfig, SourceConfig};
 use quickwit_core::{IndexService, IndexServiceError};
-use quickwit_janitor::FileEntry;
 use quickwit_metastore::{
     IndexMetadata, ListSplitsQuery, Metastore, MetastoreError, Split, SplitState,
 };
@@ -34,7 +35,6 @@ use thiserror::Error;
 use tracing::info;
 use warp::{Filter, Rejection, Reply};
 
-use crate::elastic_search_api::from_simple_list;
 use crate::format::Format;
 use crate::with_arg;
 
@@ -140,21 +140,22 @@ fn get_indexes_metadatas_handler(
 
 /// This struct represents the QueryString passed to
 /// the rest API to filter splits.
-#[derive(Debug, Clone, Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::IntoParams, utoipa::ToSchema, Default)]
 #[into_params(parameter_in = Query)]
-struct ListSplitsQueryParam {
+pub struct ListSplitsQueryParams {
     /// A specific split state(s) to filter by.
     #[serde(deserialize_with = "from_simple_list")]
-    #[serde(default)]
+    #[serde(serialize_with = "to_simple_list")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub split_states: Option<Vec<SplitState>>,
     /// If set, restrict splits to documents with a `timestamp >= start_timestamp`.
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start_timestamp: Option<i64>,
-    /// If set, restrict splits to documents with a `timestamp < end_timestamp``.
-    #[serde(default)]
+    /// If set, restrict splits to documents with a `timestamp < end_timestamp`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end_timestamp: Option<i64>,
     /// If set, restrict splits whose creation dates are before this date.
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end_create_timestamp: Option<i64>,
 }
 
@@ -166,14 +167,14 @@ struct ListSplitsQueryParam {
         (status = 200, description = "Successfully fetched splits.", body = [Split])
     ),
     params(
-        ListSplitsQueryParam,
+        ListSplitsQueryParams,
         ("index_id" = String, Path, description = "The index ID to retrieve delete tasks for."),
     )
 )]
 /// Get splits.
 async fn list_splits(
     index_id: String,
-    list_split_query: ListSplitsQueryParam,
+    list_split_query: ListSplitsQueryParams,
     metastore: Arc<dyn Metastore>,
 ) -> Result<Vec<Split>, MetastoreError> {
     info!(index_id = %index_id, list_split_query = ?list_split_query, "get-splits");

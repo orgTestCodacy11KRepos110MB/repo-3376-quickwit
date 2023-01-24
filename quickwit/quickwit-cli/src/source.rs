@@ -20,24 +20,26 @@
 use std::str::FromStr;
 
 use anyhow::{bail, Context};
+use bytes::Bytes;
 use clap::{arg, ArgMatches, Command};
 use itertools::Itertools;
 use quickwit_common::uri::Uri;
 use quickwit_config::{
     validate_identifier, ConfigFormat, SourceConfig, CLI_INGEST_SOURCE_ID, INGEST_API_SOURCE_ID,
 };
-use quickwit_core::IndexService;
 use quickwit_metastore::checkpoint::SourceCheckpoint;
-use quickwit_metastore::{quickwit_metastore_uri_resolver, IndexMetadata};
+use quickwit_rest_client::rest_client::{QuickwitClient, Transport};
 use quickwit_storage::load_file;
+use reqwest::Url;
 use serde_json::Value as JsonValue;
 use tabled::{Table, Tabled};
 
-use crate::{load_quickwit_config, make_table};
+use crate::{cluster_endpoint_arg, convert_to_json, make_table};
 
 pub fn build_source_command<'a>() -> Command<'a> {
     Command::new("source")
         .about("Manages sources.")
+        .arg(cluster_endpoint_arg())
         .subcommand(
             Command::new("create")
                 .about("Adds a new source to an index.")
@@ -61,6 +63,21 @@ pub fn build_source_command<'a>() -> Command<'a> {
                 .args(&[
                     arg!(--index <INDEX_ID> "ID of the target index"),
                     arg!(--source <SOURCE_ID> "ID of the source."),
+                ])
+            )
+        .subcommand(
+            Command::new("ingest-api")
+                .about("Enables/disables the ingest API of an index.")
+                .args(&[
+                    arg!(--index <INDEX> "ID of the target index")
+                        .display_order(1),
+                    arg!(--enable "Enables the ingest API.")
+                        .required(true)
+                        .conflicts_with("disable")
+                        .takes_value(false),
+                    arg!(--disable "Disables the ingest API.")
+                        .takes_value(false)
+                        .required(false),
                 ])
             )
         .subcommand(
@@ -110,42 +127,49 @@ pub fn build_source_command<'a>() -> Command<'a> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct CreateSourceArgs {
-    pub config_uri: Uri,
+    pub cluster_endpoint: Url,
     pub index_id: String,
     pub source_config_uri: Uri,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ToggleSourceArgs {
-    pub config_uri: Uri,
+    pub cluster_endpoint: Url,
     pub index_id: String,
     pub source_id: String,
     pub enable: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct ToggleIngestApiArgs {
+    pub cluster_endpoint: Url,
+    pub index_id: String,
+    pub enable: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct DeleteSourceArgs {
-    pub config_uri: Uri,
+    pub cluster_endpoint: Url,
     pub index_id: String,
     pub source_id: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct DescribeSourceArgs {
-    pub config_uri: Uri,
+    pub cluster_endpoint: Url,
     pub index_id: String,
     pub source_id: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ListSourcesArgs {
-    pub config_uri: Uri,
+    pub cluster_endpoint: Url,
     pub index_id: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ResetCheckpointArgs {
-    pub config_uri: Uri,
+    pub cluster_endpoint: Url,
     pub index_id: String,
     pub source_id: String,
 }
@@ -154,6 +178,7 @@ pub struct ResetCheckpointArgs {
 pub enum SourceCliCommand {
     CreateSource(CreateSourceArgs),
     ToggleSource(ToggleSourceArgs),
+    ToggleIngestApi(ToggleIngestApiArgs),
     DeleteSource(DeleteSourceArgs),
     DescribeSource(DescribeSourceArgs),
     ListSources(ListSourcesArgs),
@@ -165,6 +190,7 @@ impl SourceCliCommand {
         match self {
             Self::CreateSource(args) => create_source_cli(args).await,
             Self::ToggleSource(args) => toggle_source_cli(args).await,
+            Self::ToggleIngestApi(args) => toggle_ingest_api_cli(args).await,
             Self::DeleteSource(args) => delete_source_cli(args).await,
             Self::DescribeSource(args) => describe_source_cli(args).await,
             Self::ListSources(args) => list_sources_cli(args).await,
@@ -184,6 +210,9 @@ impl SourceCliCommand {
             "disable" => {
                 Self::parse_toggle_source_args(subcommand, submatches).map(Self::ToggleSource)
             }
+            "ingest-api" => {
+                Self::parse_toggle_ingest_api_args(submatches).map(Self::ToggleIngestApi)
+            }
             "delete" => Self::parse_delete_args(submatches).map(Self::DeleteSource),
             "describe" => Self::parse_describe_args(submatches).map(Self::DescribeSource),
             "list" => Self::parse_list_args(submatches).map(Self::ListSources),
@@ -195,10 +224,10 @@ impl SourceCliCommand {
     }
 
     fn parse_create_args(matches: &ArgMatches) -> anyhow::Result<CreateSourceArgs> {
-        let config_uri = matches
-            .value_of("config")
-            .map(Uri::from_str)
-            .expect("`config` is a required arg.")?;
+        let cluster_endpoint = matches
+            .value_of("endpoint")
+            .map(Url::from_str)
+            .expect("`endpoint` is a required arg.")?;
         let index_id = matches
             .value_of("index")
             .map(String::from)
@@ -208,7 +237,7 @@ impl SourceCliCommand {
             .map(Uri::from_str)
             .expect("`source-config` is a required arg.")?;
         Ok(CreateSourceArgs {
-            config_uri,
+            cluster_endpoint,
             index_id,
             source_config_uri,
         })
@@ -218,10 +247,10 @@ impl SourceCliCommand {
         subcommand: &str,
         matches: &ArgMatches,
     ) -> anyhow::Result<ToggleSourceArgs> {
-        let config_uri = matches
-            .value_of("config")
-            .map(Uri::from_str)
-            .expect("`config` is a required arg.")?;
+        let cluster_endpoint = matches
+            .value_of("endpoint")
+            .map(Url::from_str)
+            .expect("`endpoint` is a required arg.")?;
         let index_id = matches
             .value_of("index")
             .map(String::from)
@@ -232,18 +261,35 @@ impl SourceCliCommand {
             .expect("`source` is a required arg.");
         let enable = matches!(subcommand, "enable");
         Ok(ToggleSourceArgs {
-            config_uri,
+            cluster_endpoint,
             index_id,
             source_id,
             enable,
         })
     }
 
+    fn parse_toggle_ingest_api_args(matches: &ArgMatches) -> anyhow::Result<ToggleIngestApiArgs> {
+        let cluster_endpoint = matches
+            .value_of("endpoint")
+            .map(Url::from_str)
+            .expect("`endpoint` is a required arg.")?;
+        let index_id = matches
+            .value_of("index")
+            .expect("`index` is a required arg.")
+            .to_string();
+        let enable = matches.is_present("enable");
+        Ok(ToggleIngestApiArgs {
+            cluster_endpoint,
+            index_id,
+            enable,
+        })
+    }
+
     fn parse_delete_args(matches: &ArgMatches) -> anyhow::Result<DeleteSourceArgs> {
-        let config_uri = matches
-            .value_of("config")
-            .map(Uri::from_str)
-            .expect("`config` is a required arg.")?;
+        let cluster_endpoint = matches
+            .value_of("endpoint")
+            .map(Url::from_str)
+            .expect("`endpoint` is a required arg.")?;
         let index_id = matches
             .value_of("index")
             .map(String::from)
@@ -253,17 +299,17 @@ impl SourceCliCommand {
             .map(String::from)
             .expect("`source` is a required arg.");
         Ok(DeleteSourceArgs {
-            config_uri,
+            cluster_endpoint,
             index_id,
             source_id,
         })
     }
 
     fn parse_describe_args(matches: &ArgMatches) -> anyhow::Result<DescribeSourceArgs> {
-        let config_uri = matches
-            .value_of("config")
-            .map(Uri::from_str)
-            .expect("`config` is a required arg.")?;
+        let cluster_endpoint = matches
+            .value_of("endpoint")
+            .map(Url::from_str)
+            .expect("`endpoint` is a required arg.")?;
         let index_id = matches
             .value_of("index")
             .map(String::from)
@@ -273,32 +319,32 @@ impl SourceCliCommand {
             .map(String::from)
             .expect("`source` is a required arg.");
         Ok(DescribeSourceArgs {
-            config_uri,
+            cluster_endpoint,
             index_id,
             source_id,
         })
     }
 
     fn parse_list_args(matches: &ArgMatches) -> anyhow::Result<ListSourcesArgs> {
-        let config_uri = matches
-            .value_of("config")
-            .map(Uri::from_str)
-            .expect("`config` is a required arg.")?;
+        let cluster_endpoint = matches
+            .value_of("endpoint")
+            .map(Url::from_str)
+            .expect("`endpoint` is a required arg.")?;
         let index_id = matches
             .value_of("index")
             .map(String::from)
             .expect("`index` is a required arg.");
         Ok(ListSourcesArgs {
-            config_uri,
+            cluster_endpoint,
             index_id,
         })
     }
 
     fn parse_reset_checkpoint_args(matches: &ArgMatches) -> anyhow::Result<ResetCheckpointArgs> {
-        let config_uri = matches
-            .value_of("config")
-            .map(Uri::from_str)
-            .expect("`config` is a required arg.")?;
+        let cluster_endpoint = matches
+            .value_of("endpoint")
+            .map(Url::from_str)
+            .expect("`endpoint` is a required arg.")?;
         let index_id = matches
             .value_of("index")
             .map(String::from)
@@ -308,7 +354,7 @@ impl SourceCliCommand {
             .map(String::from)
             .expect("`source` is a required arg.");
         Ok(ResetCheckpointArgs {
-            config_uri,
+            cluster_endpoint,
             index_id,
             source_id,
         })
@@ -316,15 +362,16 @@ impl SourceCliCommand {
 }
 
 async fn create_source_cli(args: CreateSourceArgs) -> anyhow::Result<()> {
-    let quickwit_config = load_quickwit_config(&args.config_uri).await?;
-    let index_service = IndexService::from_config(quickwit_config).await?;
     let source_config_content = load_file(&args.source_config_uri).await?;
     let config_format = ConfigFormat::sniff_from_uri(&args.source_config_uri)?;
-    let source_config = config_format
-        .parse::<SourceConfig>(source_config_content.as_slice())
-        .context("Failed to parse source config.")?;
-    let source_config_after_creation = index_service
-        .create_source(&args.index_id, source_config)
+    let json_bytes = convert_to_json(source_config_content, config_format)?;
+    let endpoint =
+        Url::parse(args.cluster_endpoint.as_str()).context("Failed to parse cluster endpoint.")?;
+    let transport = Transport::new(endpoint);
+    let qw_client = QuickwitClient::new(transport);
+    let source_config_after_creation = qw_client
+        .sources(&args.index_id)
+        .create(Bytes::from(json_bytes.to_vec()))
         .await?;
     println!(
         "Source `{}` successfully created for index `{}`.",
@@ -334,22 +381,23 @@ async fn create_source_cli(args: CreateSourceArgs) -> anyhow::Result<()> {
 }
 
 async fn toggle_source_cli(args: ToggleSourceArgs) -> anyhow::Result<()> {
-    let config = load_quickwit_config(&args.config_uri).await?;
-    let metastore = quickwit_metastore_uri_resolver()
-        .resolve(&config.metastore_uri)
-        .await?;
-    if args.source_id == INGEST_API_SOURCE_ID || args.source_id == CLI_INGEST_SOURCE_ID {
+    if args.source_id == CLI_INGEST_SOURCE_ID {
         bail!(
             "Source `{}` is managed by Quickwit, you cannot enable or disable a source managed by \
              Quickwit.",
             args.source_id
         );
     }
-    validate_identifier("Source ID", &args.source_id)?;
+    let endpoint =
+        Url::parse(args.cluster_endpoint.as_str()).context("Failed to parse cluster endpoint.")?;
+    let transport = Transport::new(endpoint);
+    let qw_client = QuickwitClient::new(transport);
+    qw_client
+        .sources(&args.index_id)
+        .toggle(&args.source_id, args.enable)
+        .await
+        .context("Failed to update source")?;
 
-    metastore
-        .toggle_source(&args.index_id, &args.source_id, args.enable)
-        .await?;
     let toggled_state_name = if args.enable { "enabled" } else { "disabled" };
     println!(
         "Source `{}` successfully {} for index `{}`.",
@@ -358,12 +406,18 @@ async fn toggle_source_cli(args: ToggleSourceArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn delete_source_cli(args: DeleteSourceArgs) -> anyhow::Result<()> {
-    let config = load_quickwit_config(&args.config_uri).await?;
-    let metastore = quickwit_metastore_uri_resolver()
-        .resolve(&config.metastore_uri)
-        .await?;
+pub async fn toggle_ingest_api_cli(args: ToggleIngestApiArgs) -> anyhow::Result<()> {
+    toggle_source_cli(ToggleSourceArgs {
+        cluster_endpoint: args.cluster_endpoint,
+        enable: args.enable,
+        index_id: args.index_id,
+        source_id: INGEST_API_SOURCE_ID.to_string(),
+    })
+    .await?;
+    Ok(())
+}
 
+async fn delete_source_cli(args: DeleteSourceArgs) -> anyhow::Result<()> {
     if args.source_id == INGEST_API_SOURCE_ID || args.source_id == CLI_INGEST_SOURCE_ID {
         bail!(
             "Source `{}` is managed by Quickwit, you cannot delete a source managed by Quickwit.",
@@ -372,9 +426,15 @@ async fn delete_source_cli(args: DeleteSourceArgs) -> anyhow::Result<()> {
     }
     validate_identifier("Source ID", &args.source_id)?;
 
-    metastore
-        .delete_source(&args.index_id, &args.source_id)
-        .await?;
+    let endpoint =
+        Url::parse(args.cluster_endpoint.as_str()).context("Failed to parse cluster endpoint.")?;
+    let transport = Transport::new(endpoint);
+    let qw_client = QuickwitClient::new(transport);
+    qw_client
+        .sources(&args.index_id)
+        .delete(&args.source_id)
+        .await
+        .context("Failed to delete source.")?;
     println!(
         "Source `{}` successfully deleted for index `{}`.",
         args.source_id, args.index_id
@@ -383,8 +443,15 @@ async fn delete_source_cli(args: DeleteSourceArgs) -> anyhow::Result<()> {
 }
 
 async fn describe_source_cli(args: DescribeSourceArgs) -> anyhow::Result<()> {
-    let quickwit_config = load_quickwit_config(&args.config_uri).await?;
-    let index_metadata = resolve_index(&quickwit_config.metastore_uri, &args.index_id).await?;
+    let endpoint =
+        Url::parse(args.cluster_endpoint.as_str()).context("Failed to parse cluster endpoint.")?;
+    let transport = Transport::new(endpoint);
+    let qw_client = QuickwitClient::new(transport);
+    let index_metadata = qw_client
+        .indexes()
+        .get(&args.index_id)
+        .await
+        .context("Failed to fetch index metadata.")?;
     let source_checkpoint = index_metadata
         .checkpoint
         .source_checkpoint(&args.source_id)
@@ -437,8 +504,15 @@ where
 }
 
 async fn list_sources_cli(args: ListSourcesArgs) -> anyhow::Result<()> {
-    let quickwit_config = load_quickwit_config(&args.config_uri).await?;
-    let index_metadata = resolve_index(&quickwit_config.metastore_uri, &args.index_id).await?;
+    let endpoint =
+        Url::parse(args.cluster_endpoint.as_str()).context("Failed to parse cluster endpoint.")?;
+    let transport = Transport::new(endpoint);
+    let qw_client = QuickwitClient::new(transport);
+    let index_metadata = qw_client
+        .indexes()
+        .get(&args.index_id)
+        .await
+        .context("Failed to fetch indexes metadatas.")?;
     let table = make_list_sources_table(index_metadata.sources.into_values());
     display_tables(&[table]);
     Ok(())
@@ -518,25 +592,19 @@ fn flatten_json(value: JsonValue) -> Vec<(String, JsonValue)> {
 }
 
 async fn reset_checkpoint_cli(args: ResetCheckpointArgs) -> anyhow::Result<()> {
-    let config = load_quickwit_config(&args.config_uri).await?;
-    let metastore = quickwit_metastore_uri_resolver()
-        .resolve(&config.metastore_uri)
-        .await?;
-    metastore
-        .reset_source_checkpoint(&args.index_id, &args.source_id)
+    let endpoint =
+        Url::parse(args.cluster_endpoint.as_str()).context("Failed to parse cluster endpoint.")?;
+    let transport = Transport::new(endpoint);
+    let qw_client = QuickwitClient::new(transport);
+    qw_client
+        .sources(&args.index_id)
+        .reset_checkpoint(&args.source_id)
         .await?;
     println!(
         "Checkpoint successfully deleted for index `{}` and source `{}`.",
         args.index_id, args.source_id
     );
     Ok(())
-}
-
-async fn resolve_index(metastore_uri: &Uri, index_id: &str) -> anyhow::Result<IndexMetadata> {
-    let metastore_uri_resolver = quickwit_metastore_uri_resolver();
-    let metastore = metastore_uri_resolver.resolve(metastore_uri).await?;
-    let index_metadata = metastore.index_metadata(index_id).await?;
-    Ok(index_metadata)
 }
 
 #[cfg(test)]
@@ -580,14 +648,12 @@ mod tests {
                 "hdfs-logs",
                 "--source-config",
                 "/source-conf.yaml",
-                "--config",
-                "/conf.yaml",
             ])
             .unwrap();
         let command = CliCommand::parse_cli_args(&matches).unwrap();
         let expected_command =
             CliCommand::Source(SourceCliCommand::CreateSource(CreateSourceArgs {
-                config_uri: Uri::from_str("file:///conf.yaml").unwrap(),
+                cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
                 index_id: "hdfs-logs".to_string(),
                 source_config_uri: Uri::from_str("file:///source-conf.yaml").unwrap(),
             }));
@@ -606,14 +672,12 @@ mod tests {
                     "hdfs-logs",
                     "--source",
                     "kafka-foo",
-                    "--config",
-                    "/conf.yaml",
                 ])
                 .unwrap();
             let command = CliCommand::parse_cli_args(&matches).unwrap();
             let expected_command =
                 CliCommand::Source(SourceCliCommand::ToggleSource(ToggleSourceArgs {
-                    config_uri: Uri::from_str("file:///conf.yaml").unwrap(),
+                    cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
                     index_id: "hdfs-logs".to_string(),
                     source_id: "kafka-foo".to_string(),
                     enable: true,
@@ -630,19 +694,74 @@ mod tests {
                     "hdfs-logs",
                     "--source",
                     "kafka-foo",
-                    "--config",
-                    "/conf.yaml",
                 ])
                 .unwrap();
             let command = CliCommand::parse_cli_args(&matches).unwrap();
             let expected_command =
                 CliCommand::Source(SourceCliCommand::ToggleSource(ToggleSourceArgs {
-                    config_uri: Uri::from_str("file:///conf.yaml").unwrap(),
+                    cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
                     index_id: "hdfs-logs".to_string(),
                     source_id: "kafka-foo".to_string(),
                     enable: false,
                 }));
             assert_eq!(command, expected_command);
+        }
+    }
+
+    #[test]
+    fn test_parse_toggle_ingest_api_args() {
+        {
+            let app = build_cli().no_binary_name(true);
+            let matches = app
+                .try_get_matches_from(vec![
+                    "source",
+                    "ingest-api",
+                    "--endpoint",
+                    "https://quickwit-cluster.io",
+                    "--index",
+                    "foo",
+                    "--enable",
+                ])
+                .unwrap();
+            let command = CliCommand::parse_cli_args(&matches).unwrap();
+            let expected_command =
+                CliCommand::Source(SourceCliCommand::ToggleIngestApi(ToggleIngestApiArgs {
+                    cluster_endpoint: Url::from_str("https://quickwit-cluster.io").unwrap(),
+                    index_id: "foo".to_string(),
+                    enable: true,
+                }));
+            assert_eq!(command, expected_command);
+        }
+        {
+            let app = build_cli().no_binary_name(true);
+            let matches = app
+                .try_get_matches_from(vec!["source", "ingest-api", "--index", "foo", "--disable"])
+                .unwrap();
+            let command = CliCommand::parse_cli_args(&matches).unwrap();
+            let expected_command =
+                CliCommand::Source(SourceCliCommand::ToggleIngestApi(ToggleIngestApiArgs {
+                    cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
+                    index_id: "foo".to_string(),
+                    enable: false,
+                }));
+            assert_eq!(command, expected_command);
+        }
+        {
+            let app = build_cli().no_binary_name(true);
+            let matches = app.try_get_matches_from(vec![
+                "source",
+                "ingest-api",
+                "--index",
+                "foo",
+                "--enable",
+                "--disable",
+            ]);
+            assert!(matches.is_err());
+        }
+        {
+            let app = build_cli().no_binary_name(true);
+            let matches = app.try_get_matches_from(vec!["source", "ingest-api", "--index", "foo"]);
+            assert!(matches.is_err());
         }
     }
 
@@ -657,14 +776,12 @@ mod tests {
                 "hdfs-logs",
                 "--source",
                 "hdfs-logs-source",
-                "--config",
-                "/conf.yaml",
             ])
             .unwrap();
         let command = CliCommand::parse_cli_args(&matches).unwrap();
         let expected_command =
             CliCommand::Source(SourceCliCommand::DeleteSource(DeleteSourceArgs {
-                config_uri: Uri::from_str("file:///conf.yaml").unwrap(),
+                cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
                 index_id: "hdfs-logs".to_string(),
                 source_id: "hdfs-logs-source".to_string(),
             }));
@@ -682,14 +799,12 @@ mod tests {
                 "hdfs-logs",
                 "--source",
                 "hdfs-logs-source",
-                "--config",
-                "/conf.yaml",
             ])
             .unwrap();
         let command = CliCommand::parse_cli_args(&matches).unwrap();
         let expected_command =
             CliCommand::Source(SourceCliCommand::DescribeSource(DescribeSourceArgs {
-                config_uri: Uri::from_str("file:///conf.yaml").unwrap(),
+                cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
                 index_id: "hdfs-logs".to_string(),
                 source_id: "hdfs-logs-source".to_string(),
             }));
@@ -707,14 +822,12 @@ mod tests {
                 "hdfs-logs",
                 "--source",
                 "hdfs-logs-source",
-                "--config",
-                "/conf.yaml",
             ])
             .unwrap();
         let command = CliCommand::parse_cli_args(&matches).unwrap();
         let expected_command =
             CliCommand::Source(SourceCliCommand::ResetCheckpoint(ResetCheckpointArgs {
-                config_uri: Uri::from_str("file:///conf.yaml").unwrap(),
+                cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
                 index_id: "hdfs-logs".to_string(),
                 source_id: "hdfs-logs-source".to_string(),
             }));
@@ -781,18 +894,11 @@ mod tests {
     fn test_parse_list_sources_args() {
         let app = build_cli().no_binary_name(true);
         let matches = app
-            .try_get_matches_from(vec![
-                "source",
-                "list",
-                "--index",
-                "hdfs-logs",
-                "--config",
-                "/conf.yaml",
-            ])
+            .try_get_matches_from(vec!["source", "list", "--index", "hdfs-logs"])
             .unwrap();
         let command = CliCommand::parse_cli_args(&matches).unwrap();
         let expected_command = CliCommand::Source(SourceCliCommand::ListSources(ListSourcesArgs {
-            config_uri: Uri::from_str("file:///conf.yaml").unwrap(),
+            cluster_endpoint: Url::from_str("http://127.0.0.1:7280").unwrap(),
             index_id: "hdfs-logs".to_string(),
         }));
         assert_eq!(command, expected_command);

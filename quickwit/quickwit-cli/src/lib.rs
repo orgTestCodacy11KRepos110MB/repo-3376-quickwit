@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
+use clap::{arg, Arg};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
 use once_cell::sync::Lazy;
@@ -30,10 +31,10 @@ use quickwit_common::run_checklist;
 use quickwit_common::runtimes::RuntimesConfiguration;
 use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
-use quickwit_config::{ConfigFormat, QuickwitConfig, SourceConfig};
+use quickwit_config::{ConfigFormat, QuickwitConfig, SourceConfig, DEFAULT_QW_CONFIG_PATH};
 use quickwit_indexing::check_source_connectivity;
 use quickwit_metastore::quickwit_metastore_uri_resolver;
-use quickwit_storage::{load_file, quickwit_storage_uri_resolver};
+use quickwit_storage::{load_file, quickwit_storage_uri_resolver, OwnedBytes};
 use regex::Regex;
 use tabled::object::Rows;
 use tabled::{Alignment, Header, Modify, Style, Table, Tabled};
@@ -60,6 +61,24 @@ pub const QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER_ENV_KEY: &str =
 
 /// Regular expression representing a valid duration with unit.
 pub const DURATION_WITH_UNIT_PATTERN: &str = r#"^(\d{1,3})(s|m|h|d)$"#;
+
+fn config_cli_arg<'a>() -> Arg<'a> {
+    Arg::new("config")
+        .long("config")
+        .help("Config file location")
+        .env("QW_CONFIG")
+        .default_value(DEFAULT_QW_CONFIG_PATH)
+        .global(true)
+        .display_order(1)
+}
+
+fn cluster_endpoint_arg<'a>() -> Arg<'a> {
+    arg!(--"endpoint" <QW_CLUSTER_ENDPOINT> "Quickwit cluster endpoint.")
+        .default_value("http://127.0.0.1:7280")
+        .required(false)
+        .display_order(1)
+        .global(true)
+}
 
 /// Parse duration with unit like `1s`, `2m`, `3h`, `5d`.
 pub fn parse_duration_with_unit(duration_with_unit_str: &str) -> anyhow::Result<Duration> {
@@ -173,6 +192,41 @@ fn prompt_confirmation(prompt: &str, default: bool) -> bool {
     } else {
         println!("Aborting.");
         false
+    }
+}
+
+fn convert_to_json(bytes: OwnedBytes, config_format: ConfigFormat) -> anyhow::Result<OwnedBytes> {
+    match config_format {
+        ConfigFormat::Json => Ok(bytes),
+        ConfigFormat::Toml => {
+            // handle version value
+            let toml_value: toml::Value =
+                toml::from_slice(bytes.as_slice()).context("Failed to read TOML file.")?;
+            let json_value_bytes = serde_json::to_vec(&toml_value).expect("msg");
+            Ok(OwnedBytes::new(json_value_bytes))
+        }
+        ConfigFormat::Yaml => {
+            let mut yaml_value: serde_yaml::Value =
+                serde_yaml::from_slice(bytes.as_slice()).context("Failed to read YAML file.")?;
+            if let Some(version) = yaml_value.get_mut("version") {
+                if version.is_number() {
+                    let version_string = if let Some(version_number) = version.as_f64() {
+                        version_number.to_string()
+                    } else if let Some(version_number) = version.as_f64() {
+                        version_number.to_string()
+                    } else if let Some(version_number) = version.as_u64() {
+                        version_number.to_string()
+                    } else {
+                        bail!("Should never happen.");
+                    };
+                    *version = serde_yaml::Value::String(version_string);
+                }
+            } else {
+                bail!("Config file must contain a version field.");
+            }
+            let json_value_bytes = serde_json::to_vec(&yaml_value).expect("msg");
+            Ok(OwnedBytes::new(json_value_bytes))
+        }
     }
 }
 
