@@ -650,7 +650,7 @@ fn build_search_query(
         query.push_str("span_duration_millis:[");
 
         if let Some(min_span_duration_millis) = min_span_duration_millis_opt {
-            write!(query, "{}", min_span_duration_millis)
+            write!(query, "{min_span_duration_millis}")
                 .expect("Writing to a string should not fail.");
         } else {
             query.push('*');
@@ -658,7 +658,7 @@ fn build_search_query(
         query.push_str(" TO ");
 
         if let Some(max_span_duration_millis) = max_span_duration_millis_opt {
-            write!(query, "{}", max_span_duration_millis)
+            write!(query, "{max_span_duration_millis}")
                 .expect("Writing to a string should not fail.");
         } else {
             query.push('*');

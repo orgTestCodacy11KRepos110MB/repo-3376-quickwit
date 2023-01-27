@@ -474,7 +474,7 @@ async fn extract_split_cli(args: ExtractSplitArgs) -> anyhow::Result<()> {
     for path in bundle_storage.iter_files() {
         let mut out_path = args.target_dir.to_owned();
         out_path.push(path);
-        println!("Copying {:?}", out_path);
+        println!("Copying {out_path:?}");
         bundle_storage.copy_to_file(path, &out_path).await?;
     }
 
@@ -486,7 +486,7 @@ fn make_split_table(splits: &[Split], title: &str) -> Table {
         .iter()
         .map(|split| {
             let time_range = if let Some(time_range) = &split.split_metadata.time_range {
-                format!("[{:?}]", time_range)
+                format!("[{time_range:?}]")
             } else {
                 "[*]".to_string()
             };
@@ -541,9 +541,8 @@ fn parse_split_state(split_state_arg: &str) -> anyhow::Result<SplitState> {
         "published" => SplitState::Published,
         "marked" => SplitState::MarkedForDeletion,
         _ => bail!(format!(
-            "Failed to parse split state `{}`. Possible values are `staged`, `published`, and \
-             `marked`.",
-            split_state_arg
+            "Failed to parse split state `{split_state_arg}`. Possible values are `staged`, \
+             `published`, and `marked`."
         )),
     };
     Ok(split_state)

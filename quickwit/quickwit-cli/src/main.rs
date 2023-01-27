@@ -52,7 +52,7 @@ fn setup_logging_and_tracing(
     }
     let env_filter = env::var("RUST_LOG")
         .map(|_| EnvFilter::from_default_env())
-        .or_else(|_| EnvFilter::try_new(format!("quickwit={}", level)))
+        .or_else(|_| EnvFilter::try_new(format!("quickwit={level}")))
         .context("Failed to set up tracing env filter.")?;
     global::set_text_map_propagator(TraceContextPropagator::new());
     let registry = tracing_subscriber::registry().with(env_filter);
@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let command = match CliCommand::parse_cli_args(&matches) {
         Ok(command) => command,
         Err(err) => {
-            eprintln!("Failed to parse command arguments: {:?}", err);
+            eprintln!("Failed to parse command arguments: {err:?}");
             std::process::exit(1);
         }
     };
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         commit = build_info.commit_short_hash,
     );
     let return_code: i32 = if let Err(err) = command.execute().await {
-        eprintln!("Command failed: {:?}", err);
+        eprintln!("Command failed: {err:?}");
         1
     } else {
         0

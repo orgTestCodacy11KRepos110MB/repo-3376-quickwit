@@ -410,7 +410,7 @@ where
     let source = sources
         .into_iter()
         .find(|source| source.source_id == source_id)
-        .with_context(|| format!("Source `{}` does not exist.", source_id))?;
+        .with_context(|| format!("Source `{source_id}` does not exist."))?;
 
     let source_rows = vec![SourceRow {
         source_id: source.source_id.clone(),
@@ -505,7 +505,7 @@ fn flatten_json(value: JsonValue) -> Vec<(String, JsonValue)> {
                     if root.is_empty() {
                         key
                     } else {
-                        format!("{}.{}", root, key)
+                        format!("{root}.{key}")
                     },
                     val,
                 ));

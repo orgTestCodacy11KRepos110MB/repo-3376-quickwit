@@ -642,7 +642,7 @@ mod tests {
             .await;
         assert_eq!(resp.status(), 400);
         let body = from_utf8_lossy(resp.body());
-        println!("{}", body);
+        println!("{body}");
         assert!(body.contains("invalid type: floating point `0.4`"));
         Ok(())
     }

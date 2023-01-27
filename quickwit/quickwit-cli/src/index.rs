@@ -599,9 +599,8 @@ pub async fn create_index_cli(args: CreateIndexArgs) -> anyhow::Result<()> {
     if args.overwrite && index_exists && !args.assume_yes {
         // Stop if user answers no.
         let prompt = format!(
-            "This operation will overwrite the index `{}` and delete all its data. Do you want to \
-             proceed?",
-            index_id
+            "This operation will overwrite the index `{index_id}` and delete all its data. Do you \
+             want to proceed?"
         );
         if !prompt_confirmation(&prompt, false) {
             return Ok(());
@@ -612,7 +611,7 @@ pub async fn create_index_cli(args: CreateIndexArgs) -> anyhow::Result<()> {
     index_service
         .create_index(index_config, args.overwrite)
         .await?;
-    println!("Index `{}` successfully created.", index_id);
+    println!("Index `{index_id}` successfully created.");
     Ok(())
 }
 
@@ -627,7 +626,7 @@ pub async fn list_index_cli(args: ListIndexesArgs) -> anyhow::Result<()> {
     let index_table =
         make_list_indexes_table(indexes.into_iter().map(IndexMetadata::into_index_config));
 
-    println!("\n{}\n", index_table);
+    println!("\n{index_table}\n");
     Ok(())
 }
 
@@ -709,7 +708,7 @@ impl Tabled for IndexStats {
 
 fn display_option_in_table(opt: &Option<impl Display>) -> String {
     match opt {
-        Some(opt_val) => format!("{}", opt_val),
+        Some(opt_val) => format!("{opt_val}"),
         None => "Field does not exist for the index.".to_string(),
     }
 }
@@ -717,7 +716,7 @@ fn display_option_in_table(opt: &Option<impl Display>) -> String {
 fn display_timestamp_range(range: &Option<(i64, i64)>) -> String {
     match range {
         Some((timestamp_min, timestamp_max)) => {
-            format!("{} -> {}", timestamp_min, timestamp_max)
+            format!("{timestamp_min} -> {timestamp_max}")
         }
         _ => "Range does not exist for the index.".to_string(),
     }
@@ -961,8 +960,8 @@ pub async fn ingest_docs_cli(args: IngestDocsArgs) -> anyhow::Result<()> {
             _ => "CTRL+D",
         };
         println!(
-            "Please, enter JSON documents one line at a time.\nEnd your input using {}.",
-            eof_shortcut
+            "Please, enter JSON documents one line at a time.\nEnd your input using \
+             {eof_shortcut}."
         );
     }
     let statistics =
@@ -1039,7 +1038,7 @@ pub async fn search_index_cli(args: SearchIndexArgs) -> anyhow::Result<()> {
     let search_response: SearchResponse = search_index(args).await?;
     let search_response_rest = SearchResponseRest::try_from(search_response)?;
     let search_response_json = serde_json::to_string_pretty(&search_response_rest)?;
-    println!("{}", search_response_json);
+    println!("{search_response_json}");
     Ok(())
 }
 
@@ -1177,7 +1176,7 @@ pub async fn garbage_collect_index_cli(args: GarbageCollectIndexArgs) -> anyhow:
     if !removal_info.failed_split_ids.is_empty() {
         println!("The following splits were attempted to be removed, but failed.");
         for split_id in removal_info.failed_split_ids.iter() {
-            println!(" - {}", split_id);
+            println!(" - {split_id}");
         }
         println!(
             "{} Splits were unable to be removed.",
@@ -1290,7 +1289,7 @@ pub async fn start_statistics_reporting_loop(
 }
 
 fn colorize_error_rate(error_rate: f64) -> ColoredString {
-    let error_rate_message = format!("({:.1}% error rate)", error_rate);
+    let error_rate_message = format!("({error_rate:.1}% error rate)");
     if error_rate < 1.0 {
         error_rate_message.yellow()
     } else if error_rate < 5.0 {
@@ -1312,7 +1311,7 @@ impl<'a> Printer<'a> {
     }
 
     pub fn print_value(&mut self, fmt_args: fmt::Arguments) -> io::Result<()> {
-        write!(&mut self.stdout, " {}", fmt_args)
+        write!(&mut self.stdout, " {fmt_args}")
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -1346,9 +1345,9 @@ fn display_statistics(
         statistics.total_bytes_processed / 1_000_000
     ))?;
     printer.print_header("Thrghput")?;
-    printer.print_value(format_args!("{:>5.2}MB/s", throughput_mb_s))?;
+    printer.print_value(format_args!("{throughput_mb_s:>5.2}MB/s"))?;
     printer.print_header("Time")?;
-    printer.print_value(format_args!("{}\n", elapsed_time))?;
+    printer.print_value(format_args!("{elapsed_time}\n"))?;
     printer.flush()?;
     Ok(())
 }
