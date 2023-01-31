@@ -1330,7 +1330,7 @@ async fn test_single_node_list() -> anyhow::Result<()> {
             end_key: None,
             start_timestamp: None,
             end_timestamp: None,
-            max_hits: 100,
+            max_hits: Some(100),
         };
         let search_response = leaf_list_terms(
             searcher_context.clone(),
@@ -1354,7 +1354,7 @@ async fn test_single_node_list() -> anyhow::Result<()> {
             end_key: None,
             start_timestamp: None,
             end_timestamp: None,
-            max_hits: 1,
+            max_hits: Some(1),
         };
         let search_response = leaf_list_terms(
             searcher_context.clone(),
@@ -1375,7 +1375,7 @@ async fn test_single_node_list() -> anyhow::Result<()> {
             end_key: None,
             start_timestamp: None,
             end_timestamp: None,
-            max_hits: 100,
+            max_hits: Some(100),
         };
         let search_response = leaf_list_terms(
             searcher_context.clone(),
@@ -1396,7 +1396,7 @@ async fn test_single_node_list() -> anyhow::Result<()> {
             end_key: Some("\"casper\"".to_string()),
             start_timestamp: None,
             end_timestamp: None,
-            max_hits: 100,
+            max_hits: Some(100),
         };
         let search_response = leaf_list_terms(
             searcher_context.clone(),
